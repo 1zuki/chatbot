@@ -1,0 +1,18 @@
+# Core local model runtime
+transformers>=4.41.0
+torch>=2.2.0
+accelerate>=0.30.0
+peft>=0.11.0
+safetensors>=0.4.3
+
+# Optional but recommended for GPU 4-bit loading/training. Works mainly on Linux CUDA.
+bitsandbytes>=0.43.1; platform_system == "Linux"
+
+# Retrieval over wiki + QA corpus
+sentence-transformers>=3.0.0
+faiss-cpu>=1.8.0
+numpy>=1.24.0
+
+# Training/data utilities
+datasets>=2.19.0
+tqdm>=4.66.0

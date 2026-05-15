@@ -1,0 +1,13 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vista-chatbot"
+version = "0.1.0"
+description = "Local Minescript Minecraft chatbot with LoRA training and wiki/QA retrieval"
+requires-python = ">=3.10"
+dependencies = []
+
+[tool.setuptools.packages.find]
+where = ["src"]
