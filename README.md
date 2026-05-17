@@ -1,238 +1,262 @@
-# Vista Chatbot
+# Vista Chatbot RAG
 
-A local, production-oriented Minescript chatbot for a Minecraft server.
+A local, no-API Minecraft wiki chatbot for Minescript.
 
-`autoreply.py` loads the model locally when you run `\autoreply` in Minecraft, retrieves relevant wiki/QA context from a local FAISS index, generates a short answer, and sends it with `minescript.chat()`.
+The runtime flow is:
 
-## Folder layout
+1. `mc_integration.py` listens to in-game chat through Minescript.
+2. `BotEngine` filters spam, cooldowns, self-echoes, prefix-gated queries, commands, and special-case rules.
+3. The RAG retriever searches pre-chunked `.md` / `.mdx` wiki pages.
+4. The bot answers with either:
+   - local TinyLlama + optional LoRA adapter, grounded on retrieved wiki context, or
+   - extractive fallback that shortens the most relevant wiki chunk.
+5. Optional: in extractive mode, an LLM selector can choose the best snippet from top candidates to reduce noisy/gibberish replies.
 
-```text
+No server, no OpenAI API, and no exported environment variables are required.
+
+## Project structure
+
+```txt
 vista-chatbot/
-├── autoreply.py                  # Minescript entrypoint; copy to .minecraft/minescript
-├── configs/bot.json              # Runtime config, no exported env vars needed
-├── data/                         # Put Minecraft QA data here
-├── wiki/                         # Put server wiki .md/.mdx files here
-├── src/vista_chatbot/            # Runtime, chunking, retrieval, training code
-├── scripts/                      # CLI helpers
-└── artifacts/                    # Generated corpus, retriever index, LoRA adapter, logs
+├── config/
+│   └── bot.json                    # main config: triggers, cooldowns, model, retrieval, rules
+├── data/                           # optional training / raw QA data, not needed for RAG runtime
+├── wiki/                           # put server wiki files here, supports .md and .mdx
+├── artifacts/
+│   ├── retriever/                  # generated chunks.jsonl, embeddings.npy, meta.json
+│   └── logs/                       # autoreply.log
+├── src/vista_chatbot/
+│   ├── config.py                   # dataclass config loader
+│   ├── chunking.py                 # MD/MDX cleaner + chunker
+│   ├── retriever.py                # sentence-transformers + NumPy cosine index
+│   ├── llm.py                      # TinyLlama / LoRA local generation + fallback
+│   ├── rules.py                    # contains/exact/regex special-case replies
+│   ├── text.py                     # chat parsing, trigger stripping, output splitting
+│   ├── conversation.py             # small recent context buffer
+│   ├── logging_utils.py            # file + stream logging
+│   └── runtime.py                  # production bot engine used by Minescript
+├── scripts/
+│   ├── build_wiki_index.py         # chunk wiki and build embeddings before Minecraft
+│   ├── query_rag.py                # terminal test for retrieval/fallback answer
+│   └── install_minescript_entry.py # copies entrypoint + generated config into Minescript folder
+├── mc_integration.py               # file to move/copy into Minescript folder
+├── requirements.txt
+└── pyproject.toml
 ```
 
-## 1. Install
+## Setup
+
+Create a virtual environment from the project root:
 
 ```bash
-cd vista-chatbot
 python -m venv .venv
 source .venv/bin/activate
-pip install -U pip
 pip install -r requirements.txt
 ```
 
-For GPU training/inference, install the PyTorch build matching your CUDA version first, then run the requirements install.
+If you want 4-bit model loading, install bitsandbytes too:
 
-## 2. Add data
-
-Wiki docs:
-
-```text
-wiki/*.md
-wiki/*.mdx
-wiki/**/**/*.mdx
+```bash
+pip install bitsandbytes
 ```
 
-Minecraft QA files can be `.json` or `.jsonl`. Each record should look like:
+For CPU-only testing, set this in `config/bot.json`:
 
 ```json
-{"question":"How do I claim land?","answer":"Use /claim ...","source":"minecraft_qa"}
+"model": {
+  "enabled": false,
+  "fallback_to_extractive": true
+}
 ```
 
-Large JSON arrays also work. For huge data, `.jsonl` is still the nicest format, but top-level `.json` arrays like `[{"question": ..., "answer": ..., "source": ...}]` are streamed so the fast sampler can stop early.
+That makes the bot run as a pure RAG shortener, which is usually enough while debugging the wiki.
 
-## 3. Build balanced corpus
+## Add wiki files
 
-By default this keeps QA data roughly the same size as the wiki. For example, if the wiki produces 600 chunks, it keeps about 600 QA examples instead of all 700k rows.
+Place your server docs under `wiki/`, for example:
+
+```txt
+wiki/src/content/docs/earth/fluff/cosmetics.mdx
+wiki/src/content/docs/earth/fluff/flairs.mdx
+wiki/src/content/docs/earth/fluff/tsunami.mdx
+```
+
+The chunker supports nested folders and keeps the relative source path in the index.
+
+## Build the retriever index
+
+Run this once after changing the wiki:
 
 ```bash
-python scripts/build_corpus.py \
-  --wiki wiki \
-  --qa data/minecraft_qa.jsonl \
-  --out artifacts/corpus
+python scripts/build_wiki_index.py --config config/bot.json
 ```
 
-Useful balance controls:
+Generated files:
+
+```txt
+artifacts/retriever/chunks.jsonl
+artifacts/retriever/embeddings.npy
+artifacts/retriever/meta.json
+```
+
+## Test outside Minecraft
 
 ```bash
-# keep 2 QA examples per wiki chunk
-python scripts/build_corpus.py \
-  --wiki wiki \
-  --qa data/minecraft_qa.jsonl \
-  --qa-per-wiki-chunk 2.0
-
-# keep exactly 5000 QA examples
-python scripts/build_corpus.py \
-  --wiki wiki \
-  --qa data/minecraft_qa.jsonl \
-  --qa-target-records 5000
-
-# fast default: reads only enough QA rows, then stops
-python scripts/build_corpus.py \
-  --wiki wiki \
-  --qa data/minecraft_qa.jsonl \
-  --qa-sampling head
-
-# more representative sample, but scans the full QA dataset
-python scripts/build_corpus.py \
-  --wiki wiki \
-  --qa data/minecraft_qa.jsonl \
-  --qa-sampling reservoir
+python scripts/query_rag.py what is fluff --show-context
+python scripts/query_rag.py how to use wraps
+python scripts/query_rag.py what is tsunami
 ```
 
-Outputs:
+This tests the retriever and extractive fallback without loading Minescript.
 
-```text
-artifacts/corpus/wiki_chunks.jsonl
-artifacts/corpus/qa_retriever.jsonl
-artifacts/corpus/retriever_corpus.jsonl
-artifacts/corpus/sft_train.jsonl
-artifacts/corpus/corpus_stats.json
-```
+## Install into Minescript
 
-## 4. Build balanced retriever index
-
-`build_retriever.py` also balances by default. It indexes all wiki chunks and only about the same amount of QA docs. If `wiki_chunks.jsonl` and `qa_retriever.jsonl` exist beside the corpus, it uses those split files directly so it does not need to read a huge combined corpus.
+Run:
 
 ```bash
-python scripts/build_retriever.py \
-  --corpus artifacts/corpus/retriever_corpus.jsonl \
-  --out artifacts/retriever
+python scripts/install_minescript_entry.py --minescript-dir /path/to/.minecraft/minescript
 ```
 
-Useful controls:
+It copies:
 
-```bash
-# index 2 QA docs per wiki chunk
-python scripts/build_retriever.py --qa-per-wiki-doc 2.0
-
-# index exactly 5000 QA docs
-python scripts/build_retriever.py --qa-target-docs 5000
-
-# disable balancing and index the corpus exactly as-is
-python scripts/build_retriever.py --no-balance-to-wiki
+```txt
+mc_integration.py
+vista_chatbot_config.json
 ```
 
-This creates:
+The generated `vista_chatbot_config.json` contains an absolute `project_root`, so the script can import `src/vista_chatbot` even after being copied into the Minescript folder.
 
-```text
-artifacts/retriever/faiss.index
-artifacts/retriever/metadata.jsonl
-artifacts/retriever/config.json
-artifacts/retriever/balanced_retriever_corpus.jsonl
+In Minecraft, run:
+
+```txt
+\mc_integration
 ```
 
-## 5. Train LoRA
+## Config rules / special cases
 
-Small test run:
+`config/bot.json` contains `rules.special_cases`:
 
-```bash
-python scripts/train_lora.py \
-  --train artifacts/corpus/sft_train.jsonl \
-  --output artifacts/lora_full \
-  --max-train-samples 2000 \
-  --epochs 1
+```json
+{
+  "name": "greeting",
+  "kind": "exact_normalized",
+  "patterns": ["hi izu", "hello izu"],
+  "reply": "Meow. Ask me about the wiki, e.g. '!vista what is fluff?'",
+  "stop": true
+}
 ```
 
-Balanced full run:
+Supported `kind` values:
 
-```bash
-python scripts/train_lora.py \
-  --train artifacts/corpus/sft_train.jsonl \
-  --output artifacts/lora_full \
-  --epochs 1 \
-  --batch-size 2 \
-  --grad-accum 8
-```
+- `contains`: substring match after normalization.
+- `exact_normalized`: exact match after lowercasing, punctuation cleanup, and whitespace cleanup.
+- `regex`: Python regular expression.
 
-Default base model is `TinyLlama/TinyLlama-1.1B-Chat-v1.0`. Change it in `configs/bot.json` and pass the same value to `scripts/train_lora.py --base-model` if you switch models.
-
-## 6. Smoke test outside Minecraft
-
-Parsing only:
-
-```bash
-python scripts/smoke_test.py --skip-model --message "<Steve> izu how do I claim land?"
-```
-
-Full local generation:
-
-```bash
-python scripts/smoke_test.py --message "<Steve> izu how do I claim land?"
-```
-
-## 7. Install into Minescript
-
-Copy `autoreply.py` and a generated runtime config into your Minecraft `minescript` folder:
-
-```bash
-python scripts/install_minescript_entry.py --minescript-dir ~/.minecraft/minescript
-```
-
-On Windows, use something like:
-
-```powershell
-python scripts/install_minescript_entry.py --minescript-dir "$env:APPDATA\.minecraft\minescript"
-```
-
-Then run in Minecraft chat:
-
-```text
-\autoreply
-```
-
-Minescript runs scripts from the Minecraft `minescript` folder with a backslash command and without `.py`, so this entrypoint bootstraps the repo path from `vista_chatbot_config.json` beside `autoreply.py`.
+Set `reply` to `null` to silently ignore a message.
 
 ## Runtime commands
 
-In chat:
+In-game:
 
-```text
-izu bot status
-izu bot help
-izu clear context
-izu bot reload retriever
-izu shutdown
+```txt
+!vista status
+!vista help
+!vista whoami
+!vista clear_context
+!vista reload_retriever
+!vista stop
 ```
 
-To restrict admin commands, edit `configs/bot.json`:
+Admin control is configured in `chat`:
 
 ```json
-"admin_names": ["YourMinecraftName"],
-"admin_only_commands": true
+"chat": {
+  "admin_names": ["Izu"],
+  "admin_ranks": ["TOPAZ", "RUBY"],
+  "admin_only_commands": false,
+  "admin_command_names": [
+    "status",
+    "ping",
+    "whoami",
+    "admins",
+    "clear_context",
+    "reload_retriever",
+    "stop",
+    "quit"
+  ],
+  "critical_admin_commands": ["stop", "quit"],
+  "require_rank_for_critical_admin_commands": true,
+  "log_command_events": true
+}
 ```
 
-Then rerun `scripts/install_minescript_entry.py` so the Minescript folder gets the updated runtime config.
+Behavior:
 
-## Important config notes
+- If `admin_only_commands=true`, every command requires admin.
+- If `admin_only_commands=false`, only commands listed in `admin_command_names` require admin.
+- Admin check passes if speaker name is in `admin_names` or parsed rank is in `admin_ranks`.
+- If `require_rank_for_critical_admin_commands=true` and `admin_ranks` is non-empty, critical commands (default: `stop`, `quit`) require a staff rank match to reduce nickname spoof abuse.
+- Command events are logged with timestamps in `artifacts/logs/autoreply.log` (allow/deny, command, speaker, rank).
 
-`configs/bot.json` intentionally uses file config rather than exported environment variables because Minescript is launched from in-game chat. The installer writes an absolute `project_root` into `vista_chatbot_config.json` so imports work when `autoreply.py` is executed from `.minecraft/minescript`.
+## Production notes
 
-Key paths:
+Recommended first production setting:
 
 ```json
-"adapter_path": "artifacts/lora_full",
-"index_dir": "artifacts/retriever",
-"log_file": "artifacts/logs/autoreply.log"
+"model": {
+  "enabled": false,
+  "fallback_to_extractive": true
+}
 ```
 
-All relative paths are resolved from `project_root`.
+After the RAG answer quality is good, turn on TinyLlama:
 
-## Production checklist
+```json
+"model": {
+  "enabled": true,
+  "base_model": "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+  "adapter_path": "artifacts/lora_full",
+  "load_in_4bit": true,
+  "fallback_to_extractive": true
+}
+```
 
-- Build retriever after every big wiki update.
-- Retrain or continue LoRA when QA data changes substantially.
-- Keep `max_new_tokens` low enough for server chat.
-- Use `admin_only_commands=true` on real servers.
-- Check `artifacts/logs/autoreply.log` after crashes.
-- Start with `--qa-per-wiki-chunk 1.0` or `2.0`; avoid sending all 700k QA rows through your laptop unless you really need to.
+If the model or LoRA fails to load, `fallback_to_extractive=true` keeps the bot alive and answers using retrieved wiki text.
 
-## Why both training and retrieval?
+If you want better extractive quality (slower, but usually cleaner), enable candidate selection by LLM:
 
-Fine-tuning teaches style and common Minecraft Q/A behavior. Retrieval keeps server-specific facts fresh without retraining every time the wiki changes. For production server docs, the retriever context should usually win over memorized model knowledge.
+```json
+"model": {
+  "enabled": false,
+  "fallback_to_extractive": true,
+  "llm_select_extractive": true,
+  "llm_select_max_candidates": 6,
+  "llm_select_max_new_tokens": 8
+}
+```
+
+This mode asks the local model to pick only an index from top extractive candidates, then returns that chosen snippet.
+Even with `"enabled": false`, the model still loads for this selector step, so expect slower startup.
+
+## Updating the wiki
+
+Whenever docs change:
+
+```bash
+python scripts/build_wiki_index.py --config config/bot.json
+```
+
+Then restart the Minescript bot.
+
+## Safety behavior
+
+The bot:
+
+- answers only when the `!vista` prefix is used,
+- ignores configured blocked substrings,
+- parses decorated server chat lines like `🏕 ➟ TOPAZ Name [❄ '24] ➡ !vista ...`,
+- extracts player name and rank from decorated lines so admin command checks can work,
+- remembers its own recent messages to avoid replying to itself,
+- rate-limits globally and per user,
+- truncates and splits replies to Minecraft chat length,
+- tells users when the wiki does not contain the answer instead of inventing one.

@@ -1,223 +1,362 @@
 from __future__ import annotations
 
+import logging
 import re
 import time
+from difflib import SequenceMatcher
 from collections import defaultdict, deque
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Deque, Dict, Iterable, List, Optional, Tuple
 
-from .config import BotConfig, load_config
-from .logging_utils import setup_logging
-from .model import LocalChatModel, clear_history
-from .text_cleaning import normalize_for_match, sanitize_chat_output
+from .config import BotConfig
+from .conversation import ConversationMemory, SeenMessage
+from .llm import LocalGenerator, PromptBuilder
+from .logging_utils import configure_logging
+from .retriever import EmbeddingIndex, SearchResult
+from .rules import RuleEngine
+from .text import (
+    is_hi_pattern,
+    normalize_text,
+    parse_minecraft_chat,
+    safe_truncate,
+    sanitize_chat_output,
+    split_for_chat,
+)
 
 
-@dataclass
-class ParsedChat:
-    raw: str
-    normalized: str
-    content: str
-    normalized_content: str
-    sender: str = ""
+class MinuteRateLimiter:
+    def __init__(self, max_per_minute: int):
+        self.max_per_minute = max_per_minute
+        self.timestamps: deque[float] = deque()
 
-
-class RateLimiter:
-    def __init__(self, per_minute: int, global_cooldown: float, user_cooldown: float):
-        self.per_minute = per_minute
-        self.global_cooldown = global_cooldown
-        self.user_cooldown = user_cooldown
-        self.recent: Deque[float] = deque()
-        self.last_global = 0.0
-        self.last_by_user: Dict[str, float] = defaultdict(float)
-
-    def allow(self, user_key: str) -> bool:
-        now = time.time()
-        while self.recent and now - self.recent[0] > 60:
-            self.recent.popleft()
-        if len(self.recent) >= self.per_minute:
+    def allow(self, now: float) -> bool:
+        if self.max_per_minute <= 0:
+            return True
+        while self.timestamps and now - self.timestamps[0] > 60.0:
+            self.timestamps.popleft()
+        if len(self.timestamps) >= self.max_per_minute:
             return False
-        if now - self.last_global < self.global_cooldown:
-            return False
-        if user_key and now - self.last_by_user[user_key] < self.user_cooldown:
-            return False
-        self.recent.append(now)
-        self.last_global = now
-        if user_key:
-            self.last_by_user[user_key] = now
+        self.timestamps.append(now)
         return True
 
 
 class BotEngine:
     def __init__(self, config: BotConfig):
         self.config = config
-        self.logger = setup_logging(config.log_path, config.logging.log_level)
-        self.model = LocalChatModel(config)
+        self.logger = configure_logging(config.log_file, config.logging.log_level)
+        self.rules = RuleEngine(config.rules)
+        self.prompt_builder = PromptBuilder(config)
+        self.generator = LocalGenerator(config, logger=self.logger)
+        self.retriever: EmbeddingIndex | None = None
+        self.memory = ConversationMemory(max_turns=max(8, config.model.max_context_messages * 2))
         self.stop_requested = False
-        self.ignore_until = 0.0
-        self.last_sent_parts: List[str] = []
-        self.rate_limiter = RateLimiter(
-            per_minute=config.chat.max_replies_per_minute,
-            global_cooldown=config.chat.cooldown_seconds,
-            user_cooldown=config.chat.user_cooldown_seconds,
-        )
-        self.trigger_re = re.compile(
-            r"^(?:" + "|".join(re.escape(t) for t in config.chat.triggers) + r")(?:\b|\s|[:,.!?\-])",
-            re.IGNORECASE,
-        )
-        self.remove_trigger_re = re.compile(
-            r"^(?:" + "|".join(re.escape(t) for t in config.chat.triggers) + r")(?:\b|\s|[:,.!?\-])*",
-            re.IGNORECASE,
-        )
-        self.hi_patterns = {normalize_for_match(x) for x in config.chat.hi_patterns}
-        self.admin_names = {normalize_for_match(x) for x in config.chat.admin_names}
+        self._global_last_reply = 0.0
+        self._user_last_reply: dict[str, float] = defaultdict(float)
+        self._minute_limiter = MinuteRateLimiter(config.chat.max_replies_per_minute)
+        self._sent_messages: deque[SeenMessage] = deque(maxlen=24)
 
     @classmethod
-    def from_config_path(cls, config_path: str | Path) -> "BotEngine":
-        return cls(load_config(config_path))
+    def from_config_path(cls, path: str | Path) -> "BotEngine":
+        return cls(BotConfig.load(path))
 
     def warmup(self) -> None:
-        self.model.load()
+        self.logger.info("Starting Vista chatbot from %s", self.config.path)
+        self.logger.info("Project root: %s", self.config.project_root)
+        if self.config.retrieval.enabled:
+            self.retriever = EmbeddingIndex.load(self.config.index_dir, self.config.retrieval.embedding_model)
+            self.logger.info("Loaded retriever with %d chunks", len(self.retriever.chunks))
+            # Load embedding model early to avoid first-message lag.
+            self.retriever._load_model()
+        if self.config.model.enabled or self.config.model.llm_select_extractive:
+            self.generator.warmup()
+        self.logger.info("Warmup complete")
 
-    def parse_chat(self, raw_msg: str) -> ParsedChat:
-        raw = str(raw_msg).strip()
-        # Common server formats. Sender extraction is intentionally best-effort;
-        # command safety also works without it if admin_only_commands=false.
-        msg = raw
-        sender = ""
+    def handle_text(self, raw_text: str) -> str | None:
+        now = time.monotonic()
+        parsed = parse_minecraft_chat(raw_text)
+        content = parsed.content[: self.config.chat.max_input_chars].strip()
+        speaker = parsed.speaker or "unknown"
+        rank = parsed.rank
 
-        # Remove Minecraft formatting then split arrows used in your baseline.
-        normalized_raw = normalize_for_match(raw)
-        if "➡" in msg:
-            before, after = msg.split("➡", 1)
-            sender = _guess_sender(before)
-            msg = after
-        elif ">" in msg and "<" in msg:
-            m = re.search(r"<([^>]{1,32})>\s*(.*)", msg)
-            if m:
-                sender = m.group(1)
-                msg = m.group(2)
-        else:
-            m = re.match(r"^\s*([A-Za-z0-9_]{2,32})\s*[:»>]\s*(.*)$", msg)
-            if m:
-                sender = m.group(1)
-                msg = m.group(2)
-
-        content = msg.strip()
-        return ParsedChat(
-            raw=raw,
-            normalized=normalized_raw,
-            content=content,
-            normalized_content=normalize_for_match(content),
-            sender=normalize_for_match(sender),
-        )
-
-    def is_own_message(self, normalized_content: str) -> bool:
-        return normalized_content in self.last_sent_parts
-
-    def split_reply(self, text: str) -> List[str]:
-        max_len = self.config.chat.max_chat_chars
-        parts: List[str] = []
-        text = sanitize_chat_output(text)
-        for line in text.split("\n"):
-            line = line.strip()
-            if not line:
-                continue
-            while len(line) > max_len:
-                cut = line.rfind(" ", 0, max_len)
-                if cut <= 0:
-                    cut = max_len
-                parts.append(line[:cut].strip())
-                line = line[cut:].strip()
-            if line:
-                parts.append(line)
-        return parts or ["eh?"]
-
-    def remember_sent(self, parts: Iterable[str]) -> None:
-        self.last_sent_parts = [normalize_for_match(p) for p in parts]
-        self.ignore_until = time.time() + self.config.chat.ignore_after_send_seconds
-
-    def command_reply(self, chat: ParsedChat) -> Optional[str]:
-        msg = chat.normalized_content
-        if not msg:
+        if not content:
+            return None
+        if self._is_recent_self_echo(content, now):
+            return None
+        if self._blocked(content):
             return None
 
-        needs_admin = any(
-            token in msg
-            for token in [
-                "clear context",
-                "shutdown",
-                "shutd0wn",
-                "reload retriever",
-            ]
+        prefixed = self._strip_query_prefix(content)
+        if prefixed is None:
+            return None
+
+        rule_result = self.rules.match(prefixed)
+        if rule_result.matched:
+            self.logger.info("Rule matched: %s speaker=%s rank=%s text=%r", rule_result.rule_name, speaker, rank, prefixed)
+            return self._finalize_reply(rule_result.reply) if rule_result.reply else None
+
+        command_reply = self._handle_command(prefixed, speaker=speaker, rank=rank)
+        if command_reply is not None:
+            return command_reply
+
+        if not self._cooldown_allows(speaker, now):
+            return None
+
+        query = prefixed
+        if not query or is_hi_pattern(query, self.config.chat.hi_patterns):
+            return self._finalize_reply(f"Meow. Ask me a wiki question with {self.config.rules.command_prefix}.")
+
+        self.memory.add_user(query)
+        results = self._retrieve(query)
+        if not results:
+            reply = "I don't know from the wiki yet."
+        else:
+            prompt = self.prompt_builder.build(
+                query=query,
+                results=results,
+                history=self.memory.recent(self.config.model.max_context_messages),
+            )
+            reply = self.generator.generate_or_fallback(
+                prompt=prompt,
+                query=query,
+                results=results,
+                max_chat_chars=self.config.chat.max_chat_chars,
+            )
+        self.memory.add_assistant(reply)
+        self.logger.info("Reply speaker=%s rank=%s query=%r reply=%r", speaker, rank, query, reply)
+        return self._finalize_reply(reply)
+
+    def split_reply(self, reply: str) -> list[str]:
+        return split_for_chat(reply, self.config.chat.max_chat_chars)
+
+    def remember_sent(self, parts: list[str]) -> None:
+        now = time.monotonic()
+        for part in parts:
+            normalized = normalize_text(part)
+            if normalized:
+                self._sent_messages.append(SeenMessage(normalized, now))
+
+    def _retrieve(self, query: str) -> list[SearchResult]:
+        if not self.config.retrieval.enabled:
+            return []
+        if self.retriever is None:
+            self.logger.warning("Retriever is enabled but not loaded")
+            return []
+        return self.retriever.search(
+            query,
+            top_k=self.config.retrieval.top_k,
+            min_score=self.config.retrieval.min_score,
         )
-        if needs_admin and self.config.chat.admin_only_commands:
-            if not chat.sender or chat.sender not in self.admin_names:
-                return "no permission"
 
-        if msg in {"izu bot status", "izu print backend"}:
-            return "backend local, model loaded" if self.model.model is not None else "backend local, model not loaded yet"
-        if msg == "glaz3 d0ot":
-            return "w doot"
-        if msg in self.hi_patterns:
-            return "nihao"
-        if "izu clear context" in msg:
-            clear_history()
-            return "context cleared"
-        if "izu bot reload retriever" in msg:
-            return self.model.reload_retriever()
-        if "izu bot help" in msg:
-            return "ask: izu <question>. commands: izu bot status, izu clear context, izu bot reload retriever, izu shutdown"
-        if "izu shutdown" in msg or "izu shutd0wn" in msg:
-            self.stop_requested = True
-            return "shutting down"
-        return None
+    def _blocked(self, text: str) -> bool:
+        t = normalize_text(text)
+        return any(normalize_text(s) in t for s in self.config.chat.blocked_substrings)
 
-    def should_ignore(self, chat: ParsedChat) -> bool:
-        if not chat.normalized_content:
-            return True
-        if time.time() < self.ignore_until:
-            return True
-        if self.is_own_message(chat.normalized_content):
-            return True
-        for blocked in self.config.chat.blocked_substrings:
-            if normalize_for_match(blocked) in chat.normalized_content:
+    def _is_recent_self_echo(self, text: str, now: float) -> bool:
+        normalized = normalize_text(text)
+        ttl = self.config.chat.ignore_after_send_seconds
+        while self._sent_messages and now - self._sent_messages[0].timestamp > ttl:
+            self._sent_messages.popleft()
+        for item in self._sent_messages:
+            if item.text == normalized:
                 return True
+            # Some servers censor or slightly reformat outgoing chat before it is
+            # echoed back. A short-lived fuzzy match prevents reply loops.
+            if item.text and (item.text in normalized or normalized in item.text):
+                return True
+            if len(item.text) >= 32 and len(normalized) >= 32:
+                if SequenceMatcher(None, item.text, normalized).ratio() >= 0.88:
+                    return True
         return False
 
-    def should_trigger(self, normalized_content: str) -> bool:
-        return self.trigger_re.search(normalized_content) is not None
+    def _cooldown_allows(self, speaker: str, now: float) -> bool:
+        if now - self._global_last_reply < self.config.chat.cooldown_seconds:
+            return False
+        key = normalize_text(speaker or "unknown")
+        if now - self._user_last_reply[key] < self.config.chat.user_cooldown_seconds:
+            return False
+        if not self._minute_limiter.allow(now):
+            return False
+        self._global_last_reply = now
+        self._user_last_reply[key] = now
+        return True
 
-    def remove_trigger(self, content: str) -> str:
-        return self.remove_trigger_re.sub("", content, count=1).strip()
+    def _strip_query_prefix(self, text: str) -> str | None:
+        prefixes = self._query_prefixes()
+        if not prefixes:
+            return text.strip()
 
-    def handle_text(self, raw_msg: str) -> Optional[str]:
-        chat = self.parse_chat(raw_msg)
-        if self.should_ignore(chat):
+        # Normal case after parse_minecraft_chat(): content starts with !vista.
+        for prefix in prefixes:
+            direct = self._strip_one_prefix_at_start(text, prefix)
+            if direct is not None:
+                return direct
+
+        # Safety net for heavily decorated server chat where Minescript gives the
+        # full rendered line, e.g. `🏕 ➟ TOPAZ ➡ !vista what is fluff`.
+        # The boundary check avoids matching `!vista2` while still allowing rank
+        # prefixes before the command.
+        for prefix in prefixes:
+            pat = re.compile(rf"(?i)(^|[\s:>»›➡➜-]){re.escape(prefix)}(?=$|\s)")
+            match = pat.search(text)
+            if match:
+                return text[match.end() :].strip()
+        return None
+
+    def _query_prefixes(self) -> list[str]:
+        seen: set[str] = set()
+        prefixes: list[str] = []
+        for value in [self.config.rules.command_prefix, *self.config.chat.triggers]:
+            value = value.strip()
+            if not value or value.lower() in seen:
+                continue
+            seen.add(value.lower())
+            prefixes.append(value)
+        return prefixes
+
+    @staticmethod
+    def _strip_one_prefix_at_start(text: str, prefix: str) -> str | None:
+        if not text.lower().startswith(prefix.lower()):
+            return None
+        remaining = text[len(prefix) :]
+        if remaining and not remaining[0].isspace():
+            return None
+        return remaining.strip()
+
+    def _handle_command(self, prefixed_text: str, *, speaker: str, rank: str | None) -> str | None:
+        raw = prefixed_text.strip()
+        if not raw:
+            return self._command_help()
+
+        parts = raw.split(None, 1)
+        cmd = parts[0].lower()
+
+        aliases = {
+            "reload": "reload_retriever",
+            "reloadretriever": "reload_retriever",
+            "clear": "clear_context",
+            "clearcontext": "clear_context",
+        }
+        cmd = aliases.get(cmd, cmd)
+
+        if cmd not in {
+            "stop",
+            "quit",
+            "status",
+            "ping",
+            "help",
+            "whoami",
+            "admins",
+            "clear_context",
+            "reload_retriever",
+        }:
             return None
 
-        command = self.command_reply(chat)
-        if command is not None:
-            return command
+        admin_required = self._command_requires_admin(cmd)
+        allowed = (not admin_required) or self._is_admin(speaker=speaker, rank=rank, command=cmd)
+        self._log_command_event(
+            cmd=cmd,
+            speaker=speaker,
+            rank=rank,
+            allowed=allowed,
+            reason="admin_required" if admin_required else "open_command",
+        )
 
-        if not self.should_trigger(chat.normalized_content):
-            return None
-        if not self.rate_limiter.allow(chat.sender or "global"):
-            return None
+        if not allowed:
+            return self._finalize_reply("No permission.")
 
-        query = self.remove_trigger(chat.content)
-        query = query[: self.config.chat.max_input_chars].strip()
-        if not query:
-            return "hai?"
+        if cmd in {"stop", "quit"}:
+            self.stop_requested = True
+            return self._finalize_reply("Stopping Vista chatbot.")
+        if cmd in {"status", "ping"}:
+            chunks = len(self.retriever.chunks) if self.retriever else 0
+            llm_chat = "on" if self.config.model.enabled and self.generator.loaded else "off"
+            selector = "on" if self.config.model.llm_select_extractive and self.generator.loaded else "off"
+            admin = "yes" if self._is_admin(speaker=speaker, rank=rank, command=cmd) else "no"
+            return self._finalize_reply(
+                f"Vista online. speaker={speaker} rank={rank or '-'} admin={admin} wiki_chunks={chunks} "
+                f"llm_chat={llm_chat} llm_selector={selector}"
+            )
+        if cmd == "whoami":
+            admin = "yes" if self._is_admin(speaker=speaker, rank=rank, command=cmd) else "no"
+            return self._finalize_reply(f"Parsed speaker={speaker}, rank={rank or '-'}. admin={admin}.")
+        if cmd == "admins":
+            names = ", ".join(self.config.chat.admin_names) if self.config.chat.admin_names else "-"
+            ranks = ", ".join(self.config.chat.admin_ranks) if self.config.chat.admin_ranks else "-"
+            return self._finalize_reply(f"Admin names: {names}. Admin ranks: {ranks}.")
+        if cmd == "clear_context":
+            self.memory.clear()
+            return self._finalize_reply("Conversation context cleared.")
+        if cmd == "reload_retriever":
+            return self._finalize_reply(self._reload_retriever_message())
+        if cmd == "help":
+            return self._command_help()
 
+        return self._command_help()
+
+    def _command_requires_admin(self, cmd: str) -> bool:
+        if self.config.chat.admin_only_commands:
+            return True
+        return cmd in {normalize_text(x) for x in self.config.chat.admin_command_names}
+
+    def _is_admin(self, *, speaker: str, rank: str | None, command: str) -> bool:
+        admin_names = {normalize_text(x) for x in self.config.chat.admin_names}
+        admin_ranks = {normalize_text(x) for x in self.config.chat.admin_ranks}
+        speaker_key = normalize_text(speaker)
+        rank_key = normalize_text(rank or "")
+        by_name = bool(speaker_key and speaker_key in admin_names)
+        by_rank = bool(rank_key and rank_key in admin_ranks)
+
+        critical = normalize_text(command) in {normalize_text(x) for x in self.config.chat.critical_admin_commands}
+        if (
+            critical
+            and self.config.chat.require_rank_for_critical_admin_commands
+            and admin_ranks
+        ):
+            # Hardening against name spoof / nickname changes for sensitive commands.
+            return by_rank
+        return by_name or by_rank
+
+    def _log_command_event(
+        self,
+        *,
+        cmd: str,
+        speaker: str,
+        rank: str | None,
+        allowed: bool,
+        reason: str,
+    ) -> None:
+        if not self.config.chat.log_command_events:
+            return
+        self.logger.info(
+            "Command %s: cmd=%s speaker=%s rank=%s reason=%s",
+            "ALLOW" if allowed else "DENY",
+            cmd,
+            speaker,
+            rank or "-",
+            reason,
+        )
+
+    def _reload_retriever_message(self) -> str:
+        if not self.config.retrieval.enabled:
+            return "Retriever disabled in config."
         try:
-            return self.model.generate(query)
+            self.retriever = EmbeddingIndex.load(self.config.index_dir, self.config.retrieval.embedding_model)
+            chunks = len(self.retriever.chunks)
+            return f"Retriever reloaded. wiki_chunks={chunks}."
         except Exception as exc:
-            self.logger.exception("generation failed")
-            return f"model error: {str(exc)[:120]}"
+            self.logger.exception("Failed to reload retriever: %s", exc)
+            return f"Retriever reload failed: {str(exc)[:120]}"
 
+    def _command_help(self) -> str:
+        p = self.config.rules.command_prefix
+        return (
+            f"Use: {p} <question>. Commands: {p} help, {p} status, {p} whoami, "
+            f"{p} admins, {p} clear_context, {p} reload_retriever, {p} stop"
+        )
 
-def _guess_sender(prefix: str) -> str:
-    # Try last username-like token in the server prefix.
-    tokens = re.findall(r"[A-Za-z0-9_]{2,32}", prefix)
-    return tokens[-1] if tokens else ""
+    def _finalize_reply(self, reply: str | None) -> str | None:
+        if reply is None:
+            return None
+        reply = sanitize_chat_output(reply)
+        if self.config.chat.reply_prefix:
+            reply = f"{self.config.chat.reply_prefix}{reply}"
+        return safe_truncate(reply, self.config.chat.max_chat_chars * 3)

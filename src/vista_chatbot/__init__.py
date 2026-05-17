@@ -1,4 +1,5 @@
-"""Vista Chatbot: local Minecraft/Minescript chatbot runtime and training tools."""
+"""Vista Chatbot: local RAG Minecraft wiki assistant."""
 
-__all__ = ["__version__"]
-__version__ = "0.1.0"
+from .runtime import BotEngine
+
+__all__ = ["BotEngine"]

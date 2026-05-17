@@ -1,170 +1,162 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Iterable, Iterator, List, Optional, Sequence, Tuple
-
-from .text_cleaning import normalize_spaces, strip_markdown_mdx
-
-_HEADING_RE = re.compile(r"^(#{1,6})\s+(.+?)\s*$", re.MULTILINE)
-_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
+from typing import Iterable, Iterator
 
 
-@dataclass
-class TextChunk:
-    id: str
+@dataclass(frozen=True)
+class Chunk:
+    chunk_id: str
+    source_path: str
+    title: str
+    heading_path: list[str]
     text: str
-    source: str
-    kind: str
-    title: str = ""
-    path: str = ""
-    section: str = ""
-
-    def to_json(self) -> str:
-        return json.dumps(asdict(self), ensure_ascii=False)
+    start_char: int
+    end_char: int
 
 
-def estimate_tokens(text: str) -> int:
-    # Cheap approximation good enough for chunk boundaries without pulling a tokenizer.
-    return max(1, int(len(text) / 4))
+def discover_wiki_files(wiki_dir: Path, globs: Iterable[str]) -> list[Path]:
+    files: list[Path] = []
+    for glob in globs:
+        files.extend(p for p in wiki_dir.glob(glob) if p.is_file())
+    return sorted(set(files))
 
 
-def read_markdown_files(wiki_dir: Path) -> Iterator[Path]:
-    for suffix in ("*.md", "*.mdx"):
-        yield from sorted(wiki_dir.rglob(suffix))
+def load_wiki_chunks(
+    wiki_dir: Path,
+    *,
+    globs: Iterable[str],
+    chunk_chars: int,
+    chunk_overlap: int,
+) -> list[Chunk]:
+    chunks: list[Chunk] = []
+    for path in discover_wiki_files(wiki_dir, globs):
+        raw = path.read_text(encoding="utf-8", errors="replace")
+        cleaned = clean_mdx(raw)
+        rel = path.relative_to(wiki_dir).as_posix()
+        title = infer_title(cleaned, fallback=path.stem.replace("-", " ").replace("_", " ").title())
+        sections = list(split_sections(cleaned)) or [([], cleaned)]
+        for heading_path, section_text in sections:
+            for start, end, piece in sliding_chunks(section_text, chunk_chars, chunk_overlap):
+                text = piece.strip()
+                if len(text) < 40:
+                    continue
+                chunk_id = stable_chunk_id(rel, heading_path, start, text)
+                chunks.append(
+                    Chunk(
+                        chunk_id=chunk_id,
+                        source_path=rel,
+                        title=title,
+                        heading_path=heading_path,
+                        text=text,
+                        start_char=start,
+                        end_char=end,
+                    )
+                )
+    return chunks
 
 
-def _split_by_headings(raw_text: str) -> List[Tuple[str, str]]:
-    matches = list(_HEADING_RE.finditer(raw_text))
-    if not matches:
-        return [("", raw_text)]
+def clean_mdx(text: str) -> str:
+    text = text.replace("\r\n", "\n")
+    # YAML frontmatter.
+    text = re.sub(r"\A---\n.*?\n---\n", "", text, flags=re.DOTALL)
+    # MDX imports/exports and JSX blocks that usually do not help retrieval.
+    text = re.sub(r"^\s*import\s+.+?$", "", text, flags=re.MULTILINE)
+    text = re.sub(r"^\s*export\s+.+?$", "", text, flags=re.MULTILINE)
+    text = re.sub(r"<Tabs>[\s\S]*?</Tabs>", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"<TabItem[^>]*>", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"</TabItem>", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"<[^>]+>", " ", text)
+    # Markdown links/images -> keep readable label.
+    text = re.sub(r"!\[([^\]]*)\]\([^)]*\)", r"\1", text)
+    text = re.sub(r"\[([^\]]+)\]\([^)]*\)", r"\1", text)
+    # Code fences: keep contents, remove fence markers.
+    text = re.sub(r"```[a-zA-Z0-9_-]*\n", "", text)
+    text = text.replace("```", "")
+    # Inline code markers and emphasis.
+    text = text.replace("`", "")
+    text = re.sub(r"[*_]{1,3}", "", text)
+    # Docusaurus admonitions.
+    text = re.sub(r"^:::\w+", "", text, flags=re.MULTILINE)
+    text = re.sub(r"^:::$", "", text, flags=re.MULTILINE)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
 
-    sections: List[Tuple[str, str]] = []
-    if matches[0].start() > 0:
-        prelude = raw_text[: matches[0].start()].strip()
-        if prelude:
-            sections.append(("", prelude))
 
-    for i, match in enumerate(matches):
-        heading = match.group(2).strip()
-        start = match.end()
-        end = matches[i + 1].start() if i + 1 < len(matches) else len(raw_text)
-        body = raw_text[start:end].strip()
-        if body:
-            sections.append((heading, body))
-    return sections
+def infer_title(text: str, fallback: str) -> str:
+    for line in text.splitlines():
+        line = line.strip()
+        if line.startswith("#"):
+            return line.lstrip("#").strip() or fallback
+    return fallback
 
 
-def _window_sentences(text: str, max_tokens: int, overlap_tokens: int) -> Iterator[str]:
-    paragraphs = [p.strip() for p in re.split(r"\n{2,}", text) if p.strip()]
-    units: List[str] = []
-    for paragraph in paragraphs:
-        if estimate_tokens(paragraph) <= max_tokens:
-            units.append(paragraph)
+def split_sections(text: str) -> Iterator[tuple[list[str], str]]:
+    lines = text.splitlines()
+    current_heading: list[str] = []
+    current_lines: list[str] = []
+
+    def flush() -> Iterator[tuple[list[str], str]]:
+        section = "\n".join(current_lines).strip()
+        if section:
+            yield current_heading.copy(), section
+
+    for line in lines:
+        m = re.match(r"^(#{1,4})\s+(.+?)\s*$", line)
+        if m:
+            yield from flush()
+            level = len(m.group(1))
+            title = m.group(2).strip()
+            current_heading[:] = current_heading[: level - 1] + [title]
+            current_lines[:] = [title]
         else:
-            units.extend(s.strip() for s in _SENTENCE_SPLIT_RE.split(paragraph) if s.strip())
-
-    current: List[str] = []
-    current_tokens = 0
-    for unit in units:
-        unit_tokens = estimate_tokens(unit)
-        if current and current_tokens + unit_tokens > max_tokens:
-            chunk = "\n\n".join(current).strip()
-            if chunk:
-                yield chunk
-
-            if overlap_tokens > 0:
-                overlap: List[str] = []
-                overlap_total = 0
-                for old in reversed(current):
-                    t = estimate_tokens(old)
-                    if overlap_total + t > overlap_tokens:
-                        break
-                    overlap.append(old)
-                    overlap_total += t
-                current = list(reversed(overlap))
-                current_tokens = overlap_total
-            else:
-                current = []
-                current_tokens = 0
-
-        current.append(unit)
-        current_tokens += unit_tokens
-
-    if current:
-        chunk = "\n\n".join(current).strip()
-        if chunk:
-            yield chunk
+            current_lines.append(line)
+    yield from flush()
 
 
-def chunk_markdown_file(
-    file_path: Path,
-    wiki_root: Path,
-    max_tokens: int = 380,
-    overlap_tokens: int = 70,
-    keep_code: bool = False,
-) -> Iterator[TextChunk]:
-    rel = file_path.relative_to(wiki_root).as_posix()
-    raw = file_path.read_text(encoding="utf-8", errors="ignore")
-    title = file_path.stem.replace("_", " ").replace("-", " ").strip().title()
-
-    for section_idx, (section, body) in enumerate(_split_by_headings(raw)):
-        cleaned = strip_markdown_mdx(body, keep_code=keep_code)
-        cleaned = cleaned.strip()
-        if not cleaned:
-            continue
-        for chunk_idx, chunk_text in enumerate(_window_sentences(cleaned, max_tokens, overlap_tokens)):
-            text = normalize_spaces(chunk_text)
-            if len(text) < 40:
-                continue
-            chunk_id = f"wiki:{rel}:{section_idx}:{chunk_idx}"
-            yield TextChunk(
-                id=chunk_id,
-                text=text,
-                source=f"wiki:{rel}",
-                kind="wiki",
-                title=title,
-                path=rel,
-                section=section,
-            )
+def sliding_chunks(text: str, chunk_chars: int, overlap: int) -> Iterator[tuple[int, int, str]]:
+    normalized = re.sub(r"\n{3,}", "\n\n", text.strip())
+    if len(normalized) <= chunk_chars:
+        yield 0, len(normalized), normalized
+        return
+    start = 0
+    while start < len(normalized):
+        end = min(len(normalized), start + chunk_chars)
+        if end < len(normalized):
+            window = normalized[start:end]
+            split_at = max(window.rfind("\n\n"), window.rfind(". "), window.rfind("\n"), window.rfind(" "))
+            if split_at > chunk_chars * 0.55:
+                end = start + split_at
+        piece = normalized[start:end].strip()
+        if piece:
+            yield start, end, piece
+        if end >= len(normalized):
+            break
+        start = max(0, end - overlap)
 
 
-def chunk_wiki_dir(
-    wiki_dir: str | Path,
-    out_jsonl: str | Path,
-    max_tokens: int = 380,
-    overlap_tokens: int = 70,
-    keep_code: bool = False,
-) -> int:
-    root = Path(wiki_dir).expanduser().resolve()
-    out = Path(out_jsonl).expanduser().resolve()
-    out.parent.mkdir(parents=True, exist_ok=True)
-
-    count = 0
-    with out.open("w", encoding="utf-8") as f:
-        for path in read_markdown_files(root):
-            for chunk in chunk_markdown_file(path, root, max_tokens, overlap_tokens, keep_code):
-                f.write(chunk.to_json() + "\n")
-                count += 1
-    return count
+def stable_chunk_id(source_path: str, heading_path: list[str], start: int, text: str) -> str:
+    blob = json.dumps([source_path, heading_path, start, text[:160]], ensure_ascii=False)
+    return hashlib.sha1(blob.encode("utf-8")).hexdigest()[:16]
 
 
-def iter_jsonl(path: str | Path) -> Iterator[dict]:
-    with Path(path).open("r", encoding="utf-8") as f:
+def write_chunks_jsonl(chunks: list[Chunk], path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as f:
+        for c in chunks:
+            f.write(json.dumps(asdict(c), ensure_ascii=False) + "\n")
+
+
+def read_chunks_jsonl(path: Path) -> list[Chunk]:
+    chunks: list[Chunk] = []
+    with path.open("r", encoding="utf-8") as f:
         for line in f:
-            line = line.strip()
-            if line:
-                yield json.loads(line)
-
-
-def write_jsonl(path: str | Path, rows: Iterable[dict]) -> int:
-    out = Path(path).expanduser().resolve()
-    out.parent.mkdir(parents=True, exist_ok=True)
-    n = 0
-    with out.open("w", encoding="utf-8") as f:
-        for row in rows:
-            f.write(json.dumps(row, ensure_ascii=False) + "\n")
-            n += 1
-    return n
+            if not line.strip():
+                continue
+            item = json.loads(line)
+            chunks.append(Chunk(**item))
+    return chunks

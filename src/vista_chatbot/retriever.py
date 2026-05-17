@@ -1,173 +1,266 @@
 from __future__ import annotations
 
 import json
+import math
+import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, List, Optional, Sequence
+from typing import Iterable
 
 import numpy as np
 
-from .chunking import iter_jsonl
+from .chunking import Chunk, load_wiki_chunks, read_chunks_jsonl, write_chunks_jsonl
 from .config import RetrievalConfig
-from .text_cleaning import normalize_spaces
+from .text import compact_for_match, normalize_text, safe_truncate
 
 
-@dataclass
-class RetrievedDoc:
-    id: str
-    text: str
+@dataclass(frozen=True)
+class SearchResult:
+    chunk: Chunk
     score: float
-    source: str = ""
-    kind: str = ""
-    title: str = ""
-    path: str = ""
-    section: str = ""
-
-    def compact(self, max_chars: int = 600) -> str:
-        prefix_bits = []
-        if self.title:
-            prefix_bits.append(self.title)
-        if self.section:
-            prefix_bits.append(self.section)
-        prefix = " / ".join(prefix_bits)
-        body = self.text[:max_chars].strip()
-        if len(self.text) > max_chars:
-            body += "..."
-        if prefix:
-            return f"[{prefix}] {body}"
-        return body
 
 
-def _require_sentence_transformers():
-    try:
-        from sentence_transformers import SentenceTransformer  # type: ignore
-    except Exception as exc:  # pragma: no cover - dependency error path
-        raise RuntimeError(
-            "sentence-transformers is required for retrieval. Install requirements.txt first."
-        ) from exc
-    return SentenceTransformer
+class EmbeddingIndex:
+    """Small, dependency-light cosine-similarity index backed by NumPy.
 
+    FAISS is faster at huge scale, but for a server wiki this is easier to deploy
+    inside a Minescript workflow and avoids native index incompatibilities.
+    """
 
-def _require_faiss():
-    try:
-        import faiss  # type: ignore
-    except Exception as exc:  # pragma: no cover - dependency error path
-        raise RuntimeError("faiss-cpu or faiss-gpu is required for retrieval indexing/search.") from exc
-    return faiss
+    def __init__(self, index_dir: Path, embedding_model: str):
+        self.index_dir = index_dir
+        self.embedding_model_name = embedding_model
+        self.chunks_path = index_dir / "chunks.jsonl"
+        self.embeddings_path = index_dir / "embeddings.npy"
+        self.meta_path = index_dir / "meta.json"
+        self.chunks: list[Chunk] = []
+        self.embeddings: np.ndarray | None = None
+        self._model = None
 
-
-def _batched(items: Sequence[str], batch_size: int) -> Iterable[Sequence[str]]:
-    for i in range(0, len(items), batch_size):
-        yield items[i : i + batch_size]
-
-
-class FaissRetriever:
-    def __init__(self, index_dir: str | Path, embedding_model: Optional[str] = None):
-        self.index_dir = Path(index_dir).expanduser().resolve()
-        self.config_path = self.index_dir / "config.json"
-        self.metadata_path = self.index_dir / "metadata.jsonl"
-        self.index_path = self.index_dir / "faiss.index"
-        if not self.index_path.exists() or not self.metadata_path.exists() or not self.config_path.exists():
-            raise FileNotFoundError(
-                f"Retriever index missing in {self.index_dir}. Run scripts/build_retriever.py first."
-            )
-
-        config = json.loads(self.config_path.read_text(encoding="utf-8"))
-        model_name = embedding_model or config["embedding_model"]
-        SentenceTransformer = _require_sentence_transformers()
-        faiss = _require_faiss()
-
-        self.model = SentenceTransformer(model_name)
-        self.index = faiss.read_index(str(self.index_path))
-        self.docs = list(iter_jsonl(self.metadata_path))
-
-    @staticmethod
+    @classmethod
     def build(
-        corpus_path: str | Path,
-        index_dir: str | Path,
-        embedding_model: str = "sentence-transformers/all-MiniLM-L6-v2",
-        batch_size: int = 128,
-    ) -> dict:
-        corpus = list(iter_jsonl(corpus_path))
-        if not corpus:
-            raise ValueError(f"No corpus rows found in {corpus_path}")
-
-        SentenceTransformer = _require_sentence_transformers()
-        faiss = _require_faiss()
-        model = SentenceTransformer(embedding_model)
-
-        texts = [normalize_spaces(str(row.get("text", ""))) for row in corpus]
-        vectors: List[np.ndarray] = []
-        for batch in _batched(texts, batch_size):
-            emb = model.encode(
-                list(batch),
-                normalize_embeddings=True,
-                convert_to_numpy=True,
-                show_progress_bar=True,
-            )
-            vectors.append(emb.astype("float32"))
-        matrix = np.vstack(vectors)
-
-        index = faiss.IndexFlatIP(matrix.shape[1])
-        index.add(matrix)
-
-        out = Path(index_dir).expanduser().resolve()
-        out.mkdir(parents=True, exist_ok=True)
-        faiss.write_index(index, str(out / "faiss.index"))
-        with (out / "metadata.jsonl").open("w", encoding="utf-8") as f:
-            for row in corpus:
-                f.write(json.dumps(row, ensure_ascii=False) + "\n")
-        with (out / "config.json").open("w", encoding="utf-8") as f:
-            json.dump(
+        cls,
+        *,
+        wiki_dir: Path,
+        index_dir: Path,
+        config: RetrievalConfig,
+    ) -> "EmbeddingIndex":
+        index = cls(index_dir, config.embedding_model)
+        chunks = load_wiki_chunks(
+            wiki_dir,
+            globs=config.wiki_globs,
+            chunk_chars=config.chunk_chars,
+            chunk_overlap=config.chunk_overlap,
+        )
+        if not chunks:
+            raise RuntimeError(f"No wiki chunks found in {wiki_dir}. Add .md/.mdx files first.")
+        model = index._load_model()
+        texts = [format_chunk_for_embedding(c) for c in chunks]
+        embeddings = model.encode(
+            texts,
+            batch_size=32,
+            show_progress_bar=True,
+            convert_to_numpy=True,
+            normalize_embeddings=True,
+        ).astype("float32")
+        index_dir.mkdir(parents=True, exist_ok=True)
+        write_chunks_jsonl(chunks, index.chunks_path)
+        np.save(index.embeddings_path, embeddings)
+        index.meta_path.write_text(
+            json.dumps(
                 {
-                    "embedding_model": embedding_model,
-                    "size": len(corpus),
-                    "dim": int(matrix.shape[1]),
+                    "embedding_model": config.embedding_model,
+                    "chunk_count": len(chunks),
+                    "embedding_dim": int(embeddings.shape[1]),
+                    "wiki_dir": str(wiki_dir),
                 },
-                f,
                 indent=2,
                 ensure_ascii=False,
-            )
-            f.write("\n")
-        return {"index_dir": str(out), "size": len(corpus), "dim": int(matrix.shape[1])}
+            ),
+            encoding="utf-8",
+        )
+        index.chunks = chunks
+        index.embeddings = embeddings
+        return index
 
-    def search(self, query: str, top_k: int = 4, min_score: float = 0.0) -> List[RetrievedDoc]:
-        query = normalize_spaces(query)
-        if not query:
-            return []
-        vector = self.model.encode([query], normalize_embeddings=True, convert_to_numpy=True).astype("float32")
-        scores, indices = self.index.search(vector, max(1, top_k))
-        out: List[RetrievedDoc] = []
-        for score, idx in zip(scores[0].tolist(), indices[0].tolist()):
-            if idx < 0 or idx >= len(self.docs) or score < min_score:
-                continue
-            row = self.docs[idx]
-            out.append(
-                RetrievedDoc(
-                    id=str(row.get("id", idx)),
-                    text=str(row.get("text", "")),
-                    score=float(score),
-                    source=str(row.get("source", "")),
-                    kind=str(row.get("kind", "")),
-                    title=str(row.get("title", "")),
-                    path=str(row.get("path", "")),
-                    section=str(row.get("section", "")),
-                )
+    @classmethod
+    def load(cls, index_dir: Path, embedding_model: str) -> "EmbeddingIndex":
+        index = cls(index_dir, embedding_model)
+        if not index.chunks_path.exists() or not index.embeddings_path.exists():
+            raise FileNotFoundError(
+                f"Retriever index not found in {index_dir}. Run scripts/build_wiki_index.py first."
             )
+        index.chunks = read_chunks_jsonl(index.chunks_path)
+        index.embeddings = np.load(index.embeddings_path).astype("float32")
+        if len(index.chunks) != index.embeddings.shape[0]:
+            raise RuntimeError("Retriever index is corrupted: chunk count != embedding count")
+        return index
+
+    def search(self, query: str, *, top_k: int, min_score: float) -> list[SearchResult]:
+        if self.embeddings is None:
+            raise RuntimeError("Index is not loaded")
+        if not query.strip():
+            return []
+        model = self._load_model()
+        q = model.encode([query], convert_to_numpy=True, normalize_embeddings=True).astype("float32")[0]
+        scores = self.embeddings @ q
+        if scores.size == 0:
+            return []
+        n = min(max(top_k * 3, top_k), scores.size)
+        candidate_idx = np.argpartition(scores, -n)[-n:]
+        ranked = sorted(((int(i), float(scores[i])) for i in candidate_idx), key=lambda x: x[1], reverse=True)
+        out: list[SearchResult] = []
+        seen_sources: set[tuple[str, tuple[str, ...]]] = set()
+        for idx, score in ranked:
+            if score < min_score:
+                continue
+            chunk = self.chunks[idx]
+            key = (chunk.source_path, tuple(chunk.heading_path))
+            # Keep result diversity, but still allow another chunk if few results.
+            if key in seen_sources and len(out) >= math.ceil(top_k / 2):
+                continue
+            seen_sources.add(key)
+            out.append(SearchResult(chunk=chunk, score=score))
+            if len(out) >= top_k:
+                break
         return out
 
+    def _load_model(self):
+        if self._model is not None:
+            return self._model
+        try:
+            from sentence_transformers import SentenceTransformer
+        except Exception as exc:  # pragma: no cover - dependency environment
+            raise RuntimeError(
+                "sentence-transformers is required for retrieval. Install requirements.txt first."
+            ) from exc
+        self._model = SentenceTransformer(self.embedding_model_name)
+        return self._model
 
-class NullRetriever:
-    def search(self, query: str, top_k: int = 4, min_score: float = 0.0) -> List[RetrievedDoc]:
+
+def format_chunk_for_embedding(chunk: Chunk) -> str:
+    heading = " > ".join(chunk.heading_path)
+    return f"Title: {chunk.title}\nPath: {chunk.source_path}\nHeading: {heading}\n\n{chunk.text}"
+
+
+def build_context(results: Iterable[SearchResult], *, max_chars: int) -> str:
+    blocks: list[str] = []
+    total = 0
+    for i, result in enumerate(results, start=1):
+        chunk = result.chunk
+        heading = " > ".join(chunk.heading_path) if chunk.heading_path else chunk.title
+        block = (
+            f"[Wiki chunk {i}] source={chunk.source_path} score={result.score:.3f}\n"
+            f"Title: {chunk.title}\nHeading: {heading}\n"
+            f"Text: {chunk.text.strip()}"
+        )
+        if total + len(block) > max_chars:
+            remaining = max_chars - total
+            if remaining <= 120:
+                break
+            block = safe_truncate(block, remaining)
+        blocks.append(block)
+        total += len(block) + 2
+        if total >= max_chars:
+            break
+    return "\n\n".join(blocks)
+
+
+def extractive_answer(query: str, results: list[SearchResult], *, max_chars: int) -> str:
+    if not results:
+        return "I don't know from the wiki yet."
+    ranked = _rank_extractive_candidates(query, results)
+    if ranked and ranked[0][0] > 0:
+        answer = ranked[0][2]
+    else:
+        top = results[0].chunk
+        answer = top.text.replace("\n", " ").strip()
+    answer = reformat_extractive(answer)
+    return safe_truncate(f"Wiki says: {answer}", max_chars)
+
+
+def extractive_candidates(
+    query: str,
+    results: list[SearchResult],
+    *,
+    max_candidates: int,
+) -> list[str]:
+    """Return ranked extractive sentence candidates for optional LLM reranking."""
+    if not results or max_candidates <= 0:
         return []
+    ranked = _rank_extractive_candidates(query, results)
+    out = [text for _, _, text in ranked[:max_candidates]]
+    if out:
+        return out
+    # If sentence splitting fails on a noisy chunk, still offer one fallback candidate.
+    fallback = reformat_extractive(results[0].chunk.text.replace("\n", " ").strip())
+    return [fallback] if fallback else []
 
 
-def load_retriever(project_root: Path, cfg: RetrievalConfig):
-    if not cfg.enabled:
-        return NullRetriever()
-    index_dir = Path(cfg.index_dir).expanduser()
-    if not index_dir.is_absolute():
-        index_dir = project_root / index_dir
-    if not index_dir.exists():
-        return NullRetriever()
-    return FaissRetriever(index_dir, embedding_model=cfg.embedding_model)
+def _rank_extractive_candidates(query: str, results: list[SearchResult]) -> list[tuple[int, float, str]]:
+    query_terms = {t for t in compact_for_match(query).split() if len(t) >= 3}
+    howto_query = _looks_howto_query(query)
+    candidates: list[tuple[int, float, float, int, str]] = []
+    for result in results:
+        text = result.chunk.text.replace("\n", " ")
+        sentences = [s.strip() for s in split_sentences(text) if len(s.strip()) >= 20]
+        for sentence in sentences[:8]:
+            cleaned = reformat_extractive(sentence)
+            if len(cleaned) < 20:
+                continue
+            words = set(compact_for_match(cleaned).split())
+            overlap = len(query_terms & words)
+            intent = _intent_score(cleaned, howto_query=howto_query)
+            candidates.append((overlap, intent, float(result.score), len(cleaned), cleaned))
+    # Prefer higher lexical overlap, then intent score, then retrieval score.
+    # For ties, prefer shorter snippets so "how-to" lines beat long warning prose.
+    candidates.sort(key=lambda x: (x[0], x[1], x[2], -x[3]), reverse=True)
+
+    ranked: list[tuple[int, float, str]] = []
+    seen: set[str] = set()
+    for overlap, _intent, score, _length, text in candidates:
+        key = normalize_text(text)
+        if key in seen:
+            continue
+        seen.add(key)
+        ranked.append((overlap, score, text))
+    return ranked
+
+
+def _looks_howto_query(query: str) -> bool:
+    q = compact_for_match(query)
+    return bool(
+        re.search(
+            r"\b(how|create|make|join|claim|start|open|setup|set up|do i|how to)\b",
+            q,
+        )
+    )
+
+
+def _intent_score(sentence: str, *, howto_query: bool) -> float:
+    s = compact_for_match(sentence)
+    if not s:
+        return 0.0
+    score = 0.0
+    if howto_query:
+        if re.search(r"\b(use|type|run|create|join|claim|start|open|first|then|step)\b", s):
+            score += 0.35
+        if "/" in sentence:
+            score += 0.25
+        if re.search(r"\b(failure|bankrupt|lose|penalty|upkeep|cost)\b", s):
+            score -= 0.15
+    return score
+
+
+def split_sentences(text: str) -> list[str]:
+    import re
+
+    return re.split(r"(?<=[.!?])\s+|\s+-\s+|\n+", text)
+
+
+def reformat_extractive(text: str) -> str:
+    import re
+
+    text = re.sub(r"^#+\s*", "", text)
+    text = re.sub(r"\s+", " ", text).strip(" -•")
+    return text

@@ -1,0 +1,153 @@
+{
+  "project_root": "/home/izu/Projects/vista-chatbot",
+  "chat": {
+    "bot_name": "Toad",
+    "triggers": [
+      "!timber"
+    ],
+    "hi_patterns": [
+      "hi",
+      "hello",
+      "nihao",
+      "hey",
+      "hi izu",
+      "hello izu",
+      "hey izu",
+      "nihao izu",
+      "hi izukia",
+      "hello izukia",
+      "hey izukia",
+      "nihao izukia",
+      "hi ijok",
+      "hello ijok",
+      "hey ijok",
+      "nihao ijok"
+    ],
+    "startup_messages": [
+      "Vista wiki bot loaded. Use !vista <question>. Experimental, WILL make mistakes."
+    ],
+    "cooldown_seconds": 0.5,
+    "user_cooldown_seconds": 0.5,
+    "max_replies_per_minute": 10,
+    "max_chat_chars": 248,
+    "send_delay_seconds": 0,
+    "ignore_after_send_seconds": 8.0,
+    "max_input_chars": 800,
+    "admin_names": [
+      "Izukia",
+      "Sylfh",
+      "Greck"
+    ],
+    "admin_only_commands": true,
+    "admin_command_names": [
+      "status",
+      "ping",
+      "whoami",
+      "admins",
+      "clear_context",
+      "reload_retriever",
+      "stop",
+      "quit"
+    ],
+    "admin_ranks": [
+      "OWNER",
+      "ADMIN",
+      "MODERATOR",
+      "TOPAZ"
+    ],
+    "critical_admin_commands": [
+      "stop",
+      "quit"
+    ],
+    "require_rank_for_critical_admin_commands": true,
+    "log_command_events": true,
+    "blocked_substrings": [
+      "voted yet!"
+    ],
+    "reply_prefix": ""
+  },
+  "model": {
+    "enabled": false,
+    "base_model": "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+    "adapter_path": "artifacts/lora_full",
+    "load_in_4bit": true,
+    "torch_dtype": "auto",
+    "device_map": "auto",
+    "max_new_tokens": 96,
+    "temperature": 0.35,
+    "top_p": 0.9,
+    "top_k": 50,
+    "repetition_penalty": 1.12,
+    "do_sample": true,
+    "max_context_messages": 6,
+    "fallback_to_extractive": true,
+    "llm_select_extractive": true,
+    "llm_select_max_candidates": 6,
+    "llm_select_max_new_tokens": 8
+  },
+  "retrieval": {
+    "enabled": true,
+    "index_dir": "artifacts/retriever",
+    "embedding_model": "sentence-transformers/all-MiniLM-L6-v2",
+    "top_k": 4,
+    "min_score": 0.18,
+    "max_context_chars": 1800,
+    "chunk_chars": 850,
+    "chunk_overlap": 140,
+    "wiki_globs": [
+      "**/*.md",
+      "**/*.mdx"
+    ]
+  },
+  "rules": {
+    "command_prefix": "!timber",
+    "special_cases": [
+      {
+        "name": "ignore_vote_noise",
+        "kind": "contains",
+        "patterns": [
+          "voted yet!"
+        ],
+        "reply": null,
+        "stop": true
+      },
+      {
+        "name": "greeting",
+        "kind": "exact_normalized",
+        "patterns": [
+          "hi izu",
+          "hello izu",
+          "hey izu",
+          "nihao izu",
+          "hi izukia",
+          "hello izukia",
+          "hey izukia",
+          "nihao izukia",
+          "hi ijok",
+          "hello ijok",
+          "hey ijok",
+          "nihao ijok"
+        ],
+        "reply": "Meow. Ask me about the wiki, e.g. '!timber what is fluff?'",
+        "stop": true
+      },
+      {
+        "name": "who_are_you",
+        "kind": "regex",
+        "patterns": [
+          "\\b(who are you|what are you)\\b"
+        ],
+        "reply": "I'm izu, a small experimental wiki bot. Ask me short wiki questions.",
+        "stop": true
+      }
+    ]
+  },
+  "prompt": {
+    "system": "You are Izu, a Minecraft server wiki assistant. Answer only from the provided wiki context. Be short, friendly, and practical. If the context does not answer, say you don't know from the wiki yet. Never invent commands, prices, rules, or mechanics.",
+    "answer_style": "Use at most 2 short sentences. Prefer exact names from the wiki. No markdown tables. No citations in chat."
+  },
+  "logging": {
+    "log_file": "artifacts/logs/autoreply.log",
+    "log_level": "INFO"
+  }
+}

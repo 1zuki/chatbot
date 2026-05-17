@@ -6,7 +6,7 @@ Minescript entrypoint.
 Copy this file into your Minecraft minescript folder, plus a generated
 vista_chatbot_config.json beside it. Then run in-game as:
 
-    \autoreply
+    \\mc_integration
 
 No API server and no exported environment variables are required.
 """
@@ -16,7 +16,6 @@ import json
 import sys
 import time
 from pathlib import Path
-from typing import Optional
 
 import minescript as m
 
@@ -34,11 +33,13 @@ def _candidate_config_paths(argv: list[str]) -> list[Path]:
     ns, _ = parser.parse_known_args(argv[1:])
 
     script_dir = Path(__file__).resolve().parent
-    candidates = []
+    candidates: list[Path] = []
     if ns.config:
         candidates.append(Path(ns.config).expanduser())
     candidates.append(script_dir / CONFIG_FILE_NAME)
+    candidates.append(script_dir / "config" / "bot.json")
     candidates.append(script_dir / "configs" / "bot.json")
+    candidates.append(script_dir.parent / "config" / "bot.json")
     candidates.append(script_dir.parent / "configs" / "bot.json")
     return candidates
 
@@ -76,7 +77,9 @@ def main() -> None:
         m.echo(f"Vista chatbot loading from {config_path}")
         engine.warmup()
         m.echo("Vista chatbot loaded")
-        for msg in engine.config.chat.startup_messages:
+        startup_parts = [msg for msg in engine.config.chat.startup_messages if msg]
+        engine.remember_sent(startup_parts)
+        for msg in startup_parts:
             m.chat(msg)
 
         with m.EventQueue() as eq:
