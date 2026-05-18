@@ -6,8 +6,14 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .config import BotConfig
-from .retriever import SearchResult, build_context, extractive_answer, extractive_candidates
-from .text import safe_truncate, sanitize_chat_output
+from .retriever import (
+    UNKNOWN_WIKI_REPLY,
+    SearchResult,
+    build_context,
+    extractive_answer,
+    extractive_candidates,
+)
+from .text import normalize_text, safe_truncate, sanitize_chat_output
 
 
 @dataclass(frozen=True)
@@ -157,7 +163,10 @@ class LocalGenerator:
                 text = text.split(marker)[0]
         text = sanitize_chat_output(text)
         if not text:
-            text = "I don't know from the wiki yet."
+            return UNKNOWN_WIKI_REPLY
+        normalized = normalize_text(text)
+        if "dont know" in normalized or "don't know" in normalized:
+            return UNKNOWN_WIKI_REPLY
         return text
 
     def _needs_model(self) -> bool:
@@ -185,7 +194,7 @@ class LocalGenerator:
         if choice is None:
             return extractive_answer(query, results, max_chars=max_chat_chars)
         if choice == 0:
-            return "I don't know from the wiki yet."
+            return UNKNOWN_WIKI_REPLY
 
         selected = candidates[choice - 1]
         selected = sanitize_chat_output(selected)

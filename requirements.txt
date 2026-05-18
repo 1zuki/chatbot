@@ -4,5 +4,7 @@ transformers>=4.43.0
 torch>=2.1.0
 peft>=0.11.0
 accelerate>=0.30.0
+fastapi>=0.111.0
+uvicorn>=0.30.0
 # Optional, only needed when model.load_in_4bit=true:
 # bitsandbytes>=0.43.0

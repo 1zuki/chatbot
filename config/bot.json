@@ -24,7 +24,7 @@
       "nihao ijok"
     ],
     "startup_messages": [
-      "Vista wiki bot loaded. Use !vista <question>. Experimental, WILL make mistakes."
+      "Vista wiki bot loaded. Use !timber <question>. Experimental, WILL make mistakes."
     ],
     "cooldown_seconds": 0.5,
     "user_cooldown_seconds": 0.5,
@@ -61,6 +61,7 @@
     ],
     "require_rank_for_critical_admin_commands": true,
     "log_command_events": true,
+    "public_wiki_base_url": "https://wiki.vistavalley.xyz",
     "blocked_substrings": [
       "voted yet!"
     ],
@@ -89,11 +90,11 @@
     "enabled": true,
     "index_dir": "artifacts/retriever",
     "embedding_model": "sentence-transformers/all-MiniLM-L6-v2",
-    "top_k": 4,
+    "top_k": 5,
     "min_score": 0.18,
     "max_context_chars": 1800,
-    "chunk_chars": 850,
-    "chunk_overlap": 140,
+    "chunk_chars": 700,
+    "chunk_overlap": 120,
     "wiki_globs": [
       "**/*.md",
       "**/*.mdx"

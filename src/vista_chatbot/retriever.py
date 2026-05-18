@@ -13,11 +13,64 @@ from .chunking import Chunk, load_wiki_chunks, read_chunks_jsonl, write_chunks_j
 from .config import RetrievalConfig
 from .text import compact_for_match, normalize_text, safe_truncate
 
+UNKNOWN_WIKI_REPLY = "I don't know from the wiki yet. Try /wiki or ask staff for further assistance."
+
+QUERY_STOPWORDS = {
+    "a",
+    "an",
+    "and",
+    "are",
+    "as",
+    "at",
+    "be",
+    "can",
+    "cant",
+    "do",
+    "does",
+    "for",
+    "from",
+    "how",
+    "i",
+    "if",
+    "in",
+    "into",
+    "is",
+    "it",
+    "my",
+    "of",
+    "on",
+    "or",
+    "that",
+    "the",
+    "to",
+    "use",
+    "what",
+    "wat",
+    "when",
+    "where",
+    "which",
+    "who",
+    "with",
+    "you",
+    "your",
+}
+
 
 @dataclass(frozen=True)
 class SearchResult:
     chunk: Chunk
     score: float
+
+
+@dataclass(frozen=True)
+class ExtractiveCandidate:
+    overlap: int
+    intent: float
+    score: float
+    text: str
+    has_command: bool
+    has_requirement: bool
+    warning_like: bool
 
 
 class EmbeddingIndex:
@@ -168,13 +221,13 @@ def build_context(results: Iterable[SearchResult], *, max_chars: int) -> str:
 
 def extractive_answer(query: str, results: list[SearchResult], *, max_chars: int) -> str:
     if not results:
-        return "I don't know from the wiki yet."
+        return UNKNOWN_WIKI_REPLY
     ranked = _rank_extractive_candidates(query, results)
-    if ranked and ranked[0][0] > 0:
-        answer = ranked[0][2]
-    else:
-        top = results[0].chunk
-        answer = top.text.replace("\n", " ").strip()
+    if not ranked:
+        return UNKNOWN_WIKI_REPLY
+    if _low_confidence_match(query, ranked[0]):
+        return UNKNOWN_WIKI_REPLY
+    answer = _compose_answer_from_candidates(query, ranked)
     answer = reformat_extractive(answer)
     return safe_truncate(f"Wiki says: {answer}", max_chars)
 
@@ -189,7 +242,7 @@ def extractive_candidates(
     if not results or max_candidates <= 0:
         return []
     ranked = _rank_extractive_candidates(query, results)
-    out = [text for _, _, text in ranked[:max_candidates]]
+    out = [c.text for c in ranked[:max_candidates]]
     if out:
         return out
     # If sentence splitting fails on a noisy chunk, still offer one fallback candidate.
@@ -197,10 +250,35 @@ def extractive_candidates(
     return [fallback] if fallback else []
 
 
-def _rank_extractive_candidates(query: str, results: list[SearchResult]) -> list[tuple[int, float, str]]:
-    query_terms = {t for t in compact_for_match(query).split() if len(t) >= 3}
+def debug_extractive_candidates(
+    query: str,
+    results: list[SearchResult],
+    *,
+    max_candidates: int = 10,
+) -> list[dict[str, object]]:
+    ranked = _rank_extractive_candidates(query, results)
+    out: list[dict[str, object]] = []
+    for i, c in enumerate(ranked[:max_candidates], start=1):
+        out.append(
+            {
+                "rank": i,
+                "overlap": c.overlap,
+                "intent": round(c.intent, 3),
+                "retrieval_score": round(c.score, 3),
+                "has_command": c.has_command,
+                "has_requirement": c.has_requirement,
+                "warning_like": c.warning_like,
+                "text": c.text,
+            }
+        )
+    return out
+
+
+def _rank_extractive_candidates(query: str, results: list[SearchResult]) -> list[ExtractiveCandidate]:
+    query_terms = _query_overlap_terms(query)
     howto_query = _looks_howto_query(query)
-    candidates: list[tuple[int, float, float, int, str]] = []
+    wants_cost = _looks_cost_query(query)
+    candidates: list[tuple[int, float, float, int, str, bool, bool, bool]] = []
     for result in results:
         text = result.chunk.text.replace("\n", " ")
         sentences = [s.strip() for s in split_sentences(text) if len(s.strip()) >= 20]
@@ -211,19 +289,55 @@ def _rank_extractive_candidates(query: str, results: list[SearchResult]) -> list
             words = set(compact_for_match(cleaned).split())
             overlap = len(query_terms & words)
             intent = _intent_score(cleaned, howto_query=howto_query)
-            candidates.append((overlap, intent, float(result.score), len(cleaned), cleaned))
+            intent += _query_sentence_alignment(query, cleaned)
+            warning_like = _warning_like(cleaned)
+            has_command = _has_command(cleaned)
+            has_requirement = _has_requirement(cleaned)
+            has_cost_value = _has_cost_value(cleaned)
+            # If user did not ask about costs/warnings, slightly penalize those snippets.
+            if warning_like and not wants_cost:
+                intent -= 0.18
+            # For cost-like queries, prioritize numeric/currency snippets over
+            # warning-only text so we return actionable values first.
+            if wants_cost:
+                if has_cost_value:
+                    intent += 0.30
+                elif warning_like:
+                    intent -= 0.12
+            candidates.append(
+                (
+                    overlap,
+                    intent,
+                    float(result.score),
+                    len(cleaned),
+                    cleaned,
+                    has_command,
+                    has_requirement,
+                    warning_like,
+                )
+            )
     # Prefer higher lexical overlap, then intent score, then retrieval score.
     # For ties, prefer shorter snippets so "how-to" lines beat long warning prose.
     candidates.sort(key=lambda x: (x[0], x[1], x[2], -x[3]), reverse=True)
 
-    ranked: list[tuple[int, float, str]] = []
+    ranked: list[ExtractiveCandidate] = []
     seen: set[str] = set()
-    for overlap, _intent, score, _length, text in candidates:
+    for overlap, intent, score, _length, text, has_command, has_requirement, warning_like in candidates:
         key = normalize_text(text)
         if key in seen:
             continue
         seen.add(key)
-        ranked.append((overlap, score, text))
+        ranked.append(
+            ExtractiveCandidate(
+                overlap=overlap,
+                intent=intent,
+                score=score,
+                text=text,
+                has_command=has_command,
+                has_requirement=has_requirement,
+                warning_like=warning_like,
+            )
+        )
     return ranked
 
 
@@ -252,6 +366,182 @@ def _intent_score(sentence: str, *, howto_query: bool) -> float:
     return score
 
 
+def _query_sentence_alignment(query: str, sentence: str) -> float:
+    q = compact_for_match(query)
+    s = compact_for_match(sentence)
+    score = 0.0
+    command_query = _looks_command_query(query)
+    has_cmd = _has_command(sentence)
+
+    if command_query:
+        if has_cmd:
+            score += 0.45
+        else:
+            score -= 0.10
+
+    # "How do I go/tp..." should not be answered by "set ..." commands.
+    nav_query = _looks_navigation_query(query)
+    if nav_query:
+        if re.search(r"\b(set|setting|configure|create)\b", s):
+            score -= 0.30
+        if re.search(r"\b(spawn|warp|teleport|tp|go)\b", s):
+            score += 0.20
+    return score
+
+
+def _query_overlap_terms(query: str) -> set[str]:
+    terms = set()
+    for token in compact_for_match(query).split():
+        if len(token) < 2:
+            continue
+        if token in QUERY_STOPWORDS:
+            continue
+        terms.add(token)
+    return terms
+
+
+def _low_confidence_match(query: str, top: ExtractiveCandidate) -> bool:
+    query_terms = _query_overlap_terms(query)
+    if not query_terms:
+        return False
+    sentence_terms = set(compact_for_match(top.text).split())
+    matched = query_terms & sentence_terms
+    match_count = len(matched)
+    match_ratio = match_count / max(1, len(query_terms))
+    howto_query = _looks_howto_query(query)
+    command_query = _looks_command_query(query)
+    navigation_query = _looks_navigation_query(query)
+    has_action = _has_action_words(top.text)
+
+    if command_query and top.has_command and match_count >= 1:
+        return False
+    if navigation_query and not has_action:
+        return True
+    if howto_query and not top.has_command and not has_action and match_count <= 1:
+        return True
+    if len(query_terms) >= 2 and match_count == 0:
+        return True
+    if len(query_terms) >= 3 and match_ratio < 0.34 and top.score < 0.35:
+        return True
+    return False
+
+
+def _looks_cost_query(query: str) -> bool:
+    q = compact_for_match(query)
+    return bool(
+        re.search(
+            r"\b(cost|price|upkeep|bankrupt|money|fee|tax|maintenance)\b",
+            q,
+        )
+    )
+
+
+def _looks_command_query(query: str) -> bool:
+    q = compact_for_match(query)
+    return bool(re.search(r"\b(command|cmd|syntax|type|use|what is the command)\b", q))
+
+
+def _warning_like(sentence: str) -> bool:
+    s = compact_for_match(sentence)
+    return bool(re.search(r"\b(failure|bankrupt|lose|penalty|upkeep|cost|warning|danger)\b", s))
+
+
+def _has_command(sentence: str) -> bool:
+    return bool(re.search(r"(?:^|\s)/[a-z0-9_]+", sentence.lower()))
+
+
+def _has_requirement(sentence: str) -> bool:
+    s = compact_for_match(sentence)
+    return bool(re.search(r"\b(required|requirement|must|need|at least)\b", s))
+
+
+def _looks_navigation_query(query: str) -> bool:
+    q = compact_for_match(query)
+    return bool(re.search(r"\b(go|teleport|tp|warp|visit|get to|reach)\b", q))
+
+
+def _has_action_words(sentence: str) -> bool:
+    normalized = normalize_text(sentence)
+    if re.search(r"(?:^|\s)/[a-z0-9_]+", normalized):
+        return True
+
+    s = compact_for_match(sentence)
+    return bool(
+        re.search(
+            r"\b(use|type|run|go|teleport(?:s|ed|ing)?|tp|warp|portal|enter|visit|claim|create|join|buy|set)\b",
+            s,
+        )
+    )
+
+
+def _has_cost_value(sentence: str) -> bool:
+    s = normalize_text(sentence)
+    if re.search(r"\$\s*\d", s):
+        return True
+    if re.search(r"\b\d[\d\s,._]*\b", s) and re.search(r"\b(cost|price|money|upkeep|fee|tax)\b", s):
+        return True
+    if re.search(r"\b\d[\d\s,._]*\b", s) and re.search(r"\b(in-game money|dollars?)\b", s):
+        return True
+    return False
+
+
+def _compose_answer_from_candidates(query: str, ranked: list[ExtractiveCandidate]) -> str:
+    howto_query = _looks_howto_query(query)
+    command_query = _looks_command_query(query)
+    primary = ranked[0]
+    if not howto_query:
+        if command_query:
+            for c in ranked:
+                if c.has_command and c.overlap > 0:
+                    return c.text
+        return primary.text
+
+    # For how-to, prefer actionable/requirement snippets with overlap.
+    for c in ranked:
+        if c.overlap <= 0:
+            continue
+        if command_query and c.has_command:
+            primary = c
+            break
+        if c.has_command or c.has_requirement or not c.warning_like:
+            primary = c
+            break
+
+    secondary: ExtractiveCandidate | None = None
+    for c in ranked:
+        if c.text == primary.text:
+            continue
+        if c.overlap <= 0:
+            continue
+        if c.warning_like and not _looks_cost_query(query):
+            continue
+        if primary.has_command and c.has_requirement:
+            secondary = c
+            break
+        if primary.has_requirement and c.has_command:
+            secondary = c
+            break
+
+    if secondary is None:
+        return primary.text
+
+    merged = f"{primary.text} {secondary.text}"
+    return _dedupe_phrases(merged)
+
+
+def _dedupe_phrases(text: str) -> str:
+    parts = [reformat_extractive(p) for p in split_sentences(text) if p.strip()]
+    out: list[str] = []
+    seen: set[str] = set()
+    for p in parts:
+        key = normalize_text(p)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        out.append(p)
+    return " ".join(out).strip()
+
+
 def split_sentences(text: str) -> list[str]:
     import re
 
@@ -262,5 +552,13 @@ def reformat_extractive(text: str) -> str:
     import re
 
     text = re.sub(r"^#+\s*", "", text)
+    if "|" in text:
+        cells = [c.strip() for c in text.split("|") if c.strip()]
+        if cells:
+            if len(cells) >= 2:
+                text = f"{cells[0]} - {cells[1]}"
+            else:
+                text = cells[0]
+    text = text.replace("`", "")
     text = re.sub(r"\s+", " ", text).strip(" -•")
     return text

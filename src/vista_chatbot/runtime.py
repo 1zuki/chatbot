@@ -11,7 +11,7 @@ from .config import BotConfig
 from .conversation import ConversationMemory, SeenMessage
 from .llm import LocalGenerator, PromptBuilder
 from .logging_utils import configure_logging
-from .retriever import EmbeddingIndex, SearchResult
+from .retriever import UNKNOWN_WIKI_REPLY, EmbeddingIndex, SearchResult
 from .rules import RuleEngine
 from .text import (
     is_hi_pattern,
@@ -97,17 +97,55 @@ class BotEngine:
         if command_reply is not None:
             return command_reply
 
-        if not self._cooldown_allows(speaker, now):
-            return None
+        reply, _results = self.answer_query(
+            prefixed,
+            speaker=speaker,
+            rank=rank,
+            apply_cooldown=True,
+            now=now,
+        )
+        return reply
 
-        query = prefixed
+    def answer_query(
+        self,
+        query: str,
+        *,
+        speaker: str = "unknown",
+        rank: str | None = None,
+        apply_cooldown: bool = False,
+        now: float | None = None,
+    ) -> tuple[str | None, list[SearchResult]]:
+        current = now if now is not None else time.monotonic()
+        return self._answer_query_core(
+            query,
+            speaker=speaker,
+            rank=rank,
+            now=current,
+            apply_cooldown=apply_cooldown,
+        )
+
+    def _answer_query_core(
+        self,
+        query: str,
+        *,
+        speaker: str,
+        rank: str | None,
+        now: float,
+        apply_cooldown: bool,
+    ) -> tuple[str | None, list[SearchResult]]:
+        query = query[: self.config.chat.max_input_chars].strip()
+        if apply_cooldown and not self._cooldown_allows(speaker, now):
+            return None, []
         if not query or is_hi_pattern(query, self.config.chat.hi_patterns):
-            return self._finalize_reply(f"Meow. Ask me a wiki question with {self.config.rules.command_prefix}.")
+            return (
+                self._finalize_reply(f"Meow. Ask me a wiki question with {self.config.rules.command_prefix}."),
+                [],
+            )
 
         self.memory.add_user(query)
         results = self._retrieve(query)
         if not results:
-            reply = "I don't know from the wiki yet."
+            reply = UNKNOWN_WIKI_REPLY
         else:
             prompt = self.prompt_builder.build(
                 query=query,
@@ -122,7 +160,7 @@ class BotEngine:
             )
         self.memory.add_assistant(reply)
         self.logger.info("Reply speaker=%s rank=%s query=%r reply=%r", speaker, rank, query, reply)
-        return self._finalize_reply(reply)
+        return self._finalize_reply(reply), results
 
     def split_reply(self, reply: str) -> list[str]:
         return split_for_chat(reply, self.config.chat.max_chat_chars)

@@ -39,6 +39,7 @@ class ChatConfig:
     critical_admin_commands: list[str] = field(default_factory=lambda: ["stop", "quit"])
     require_rank_for_critical_admin_commands: bool = True
     log_command_events: bool = True
+    public_wiki_base_url: str = ""
     blocked_substrings: list[str] = field(default_factory=list)
     reply_prefix: str = ""
 
@@ -69,11 +70,11 @@ class RetrievalConfig:
     enabled: bool = True
     index_dir: str = "artifacts/retriever"
     embedding_model: str = "sentence-transformers/all-MiniLM-L6-v2"
-    top_k: int = 4
+    top_k: int = 5
     min_score: float = 0.18
     max_context_chars: int = 1800
-    chunk_chars: int = 850
-    chunk_overlap: int = 140
+    chunk_chars: int = 700
+    chunk_overlap: int = 120
     wiki_globs: list[str] = field(default_factory=lambda: ["**/*.md", "**/*.mdx"])
 
 

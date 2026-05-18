@@ -10,7 +10,7 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from vista_chatbot.config import BotConfig
-from vista_chatbot.retriever import EmbeddingIndex, extractive_answer
+from vista_chatbot.retriever import EmbeddingIndex, debug_extractive_candidates, extractive_answer
 
 
 def main() -> None:
@@ -18,6 +18,7 @@ def main() -> None:
     parser.add_argument("query", nargs="+", help="Question to ask")
     parser.add_argument("--config", default=str(PROJECT_ROOT / "config" / "bot.json"))
     parser.add_argument("--show-context", action="store_true")
+    parser.add_argument("--show-candidates", action="store_true")
     args = parser.parse_args()
 
     cfg = BotConfig.load(args.config)
@@ -25,6 +26,15 @@ def main() -> None:
     index = EmbeddingIndex.load(cfg.index_dir, cfg.retrieval.embedding_model)
     results = index.search(query, top_k=cfg.retrieval.top_k, min_score=cfg.retrieval.min_score)
     print(extractive_answer(query, results, max_chars=cfg.chat.max_chat_chars))
+    if args.show_candidates:
+        print("\n=== Ranked extractive candidates ===")
+        for c in debug_extractive_candidates(query, results, max_candidates=8):
+            print(
+                f"#{c['rank']} overlap={c['overlap']} intent={c['intent']} "
+                f"retr={c['retrieval_score']} cmd={c['has_command']} req={c['has_requirement']} warn={c['warning_like']}"
+            )
+            print(c["text"])
+            print()
     if args.show_context:
         for r in results:
             print("\n---")
