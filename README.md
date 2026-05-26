@@ -30,6 +30,7 @@ vista-chatbot/
 │   ├── chunking.py                 # MD/MDX cleaner + chunker
 │   ├── retriever.py                # sentence-transformers + NumPy cosine index
 │   ├── llm.py                      # TinyLlama / LoRA local generation + fallback
+│   ├── web_api.py                  # FastAPI chat endpoint for website widget
 │   ├── rules.py                    # contains/exact/regex special-case replies
 │   ├── text.py                     # chat parsing, trigger stripping, output splitting
 │   ├── conversation.py             # small recent context buffer
@@ -38,6 +39,7 @@ vista-chatbot/
 ├── scripts/
 │   ├── build_wiki_index.py         # chunk wiki and build embeddings before Minecraft
 │   ├── query_rag.py                # terminal test for retrieval/fallback answer
+│   ├── run_chat_api.py             # run HTTP API for website chat widget
 │   └── install_minescript_entry.py # copies entrypoint + generated config into Minescript folder
 ├── mc_integration.py               # file to move/copy into Minescript folder
 ├── requirements.txt
@@ -109,6 +111,35 @@ python scripts/query_rag.py how do i create a nation --show-context --show-candi
 ```
 
 This tests the retriever and extractive fallback without loading Minescript.
+
+
+## Website chat widget (API + bottom-right tab)
+
+Run the API:
+
+```bash
+python scripts/run_chat_api.py \
+  --config config/bot.json \
+  --host 127.0.0.1 \
+  --port 8787 \
+  --cors-origins "http://localhost:4321,https://wiki.vistavalley.xyz" \
+  --public-wiki-base-url "https://wiki.vistavalley.xyz"
+```
+
+The endpoint is:
+
+- `POST /api/chat` with JSON: `{"message":"how do i create a nation","session_id":"optional"}`
+- `GET /api/health`
+
+Response includes:
+
+- `reply`: chatbot answer text
+- `session_id`: conversation key to keep context
+- `links`: URL list found in reply/sources
+- `sources`: wiki page links the frontend can render as clickable redirects
+
+For `wiki-src` (Astro/Starlight), the widget is injected globally via
+`wiki-src/astro.config.mjs` and loaded from `wiki-src/public/vista-chatbot-widget.js`.
 
 ## Install into Minescript
 
