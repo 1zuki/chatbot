@@ -1,7 +1,7 @@
 {
   "project_root": "/home/izu/Projects/vista-chatbot",
   "chat": {
-    "bot_name": "Toad",
+    "bot_name": "Timber",
     "triggers": [
       "!timber"
     ],
@@ -24,15 +24,19 @@
       "nihao ijok"
     ],
     "startup_messages": [
-      "Vista wiki bot loaded. Use !timber <question>. Experimental, WILL make mistakes."
+      "Timber wiki loaded. Use !timber <question>. In beta test, can make mistakes."
     ],
     "cooldown_seconds": 0.5,
     "user_cooldown_seconds": 0.5,
     "max_replies_per_minute": 10,
-    "max_chat_chars": 248,
+    "max_chat_chars": 256,
     "send_delay_seconds": 0,
-    "ignore_after_send_seconds": 8.0,
+    "ignore_after_send_seconds": 4.0,
     "max_input_chars": 800,
+    "history_enabled": false,
+    "blacklisted_users": [
+      "a"
+    ],
     "admin_names": [
       "Izukia",
       "Sylfh",
@@ -45,6 +49,8 @@
       "whoami",
       "admins",
       "clear_context",
+      "history",
+      "context",
       "reload_retriever",
       "stop",
       "quit"
@@ -71,7 +77,7 @@
     "enabled": false,
     "base_model": "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
     "adapter_path": "artifacts/lora_full",
-    "load_in_4bit": true,
+    "load_in_4bit": false,
     "torch_dtype": "auto",
     "device_map": "auto",
     "max_new_tokens": 96,
@@ -82,7 +88,7 @@
     "do_sample": true,
     "max_context_messages": 6,
     "fallback_to_extractive": true,
-    "llm_select_extractive": true,
+    "llm_select_extractive": false,
     "llm_select_max_candidates": 6,
     "llm_select_max_new_tokens": 8
   },
@@ -140,15 +146,276 @@
         ],
         "reply": "I'm izu, a small experimental wiki bot. Ask me short wiki questions.",
         "stop": true
+      },
+      {
+        "name": "gei",
+        "kind": "contains",
+        "patterns": [
+          "is kupi gei",
+          "is kudi gei",
+          "is grek gei",
+          "is dot gei",
+          "is greck gei"
+        ],
+        "reply": "yuh hes gei",
+        "stop": true
+      },
+      {
+        "name": "notgei",
+        "kind": "contains",
+        "patterns": [
+          "is myztik gei",
+          "is mystic gei",
+          "is izu gei",
+          "is ijok gei",
+          "is jijo gei"
+        ],
+        "reply": "well, according to the wiki, no",
+        "stop": true
+      },
+      {
+        "name": "w",
+        "kind": "contains",
+        "patterns": [
+          "w doot",
+          "w kudi",
+          "w myztik"
+        ],
+        "reply": "w",
+        "stop": true
+      },
+      {
+        "name": "l",
+        "kind": "contains",
+        "patterns": [
+          "l ijok",
+          "l izu"
+        ],
+        "reply": "L",
+        "stop": true
+      },
+      {
+        "name": "pokon problem",
+        "kind": "exact_normalized",
+        "patterns": [
+          "pokon problem"
+        ],
+        "reply": "pokon problem",
+        "stop": true
+      },
+      {
+        "name": "megumin",
+        "kind": "contains",
+        "patterns": [
+          "who is megumin?"
+        ],
+        "reply": "Waga na wa Megumin! Ākuwizādo o nariwai toshi, saikyō no kōgeki no mahō bakuretsu mahō o ayatsuru mono! EXPLOSIONNN!",
+        "stop": true
+      },
+      {
+        "name": "what_is_love",
+        "kind": "contains",
+        "patterns": [
+          "what is love"
+        ],
+        "reply": "baby don't hurt me, don't hurt me, no more",
+        "stop": true
+      },
+      {
+        "name": "are_you_sentient",
+        "kind": "regex",
+        "patterns": [
+          "\\b(are you (sentient|alive|sapient|conscious|real)|do you have feelings)\\b"
+        ],
+        "reply": "I am but a humble pile of if-statements wearing a wizard hat. EXPLOSIONNN!",
+        "stop": true
+      },
+      {
+        "name": "diamonds",
+        "kind": "contains",
+        "patterns": [
+          "where are the diamonds",
+          "where do i find diamonds",
+          "how do i get diamonds"
+        ],
+        "reply": "have you tried digging straight down? trust me bro",
+        "stop": true
+      },
+      {
+        "name": "creeper",
+        "kind": "exact_normalized",
+        "patterns": [
+          "creeper",
+          "aw man"
+        ],
+        "reply": "aw man",
+        "stop": true
+      },
+      {
+        "name": "rickroll",
+        "kind": "contains",
+        "patterns": [
+          "never gonna give you up",
+          "never gonna let you down"
+        ],
+        "reply": "never gonna run around and desert you. (you got timber'd)",
+        "stop": true
+      },
+      {
+        "name": "the_cake",
+        "kind": "contains",
+        "patterns": [
+          "is the cake a lie"
+        ],
+        "reply": "the cake is a lie. but the chest shops are real, try !timber chestshop",
+        "stop": true
+      },
+      {
+        "name": "skill_issue",
+        "kind": "contains",
+        "patterns": [
+          "i died",
+          "i keep dying",
+          "i lost my stuff"
+        ],
+        "reply": "sounds like a skill issue tbh. /back might save you though",
+        "stop": true
+      },
+      {
+        "name": "aqua",
+        "kind": "regex",
+        "patterns": [
+          "\\b(who is aqua|is aqua useless|aqua useless)\\b"
+        ],
+        "reply": "useless goddess. great at parties, terrible at everything else. PURIFICATION!",
+        "stop": true
+      },
+      {
+        "name": "darkness",
+        "kind": "regex",
+        "patterns": [
+          "\\b(who is darkness|hit me|hurt me more)\\b"
+        ],
+        "reply": "a crusader who can't hit anything but really, really wants to get hit. weirdo.",
+        "stop": true
+      },
+      {
+        "name": "kazuma",
+        "kind": "contains",
+        "patterns": [
+          "who is kazuma",
+          "kazuma kazuma"
+        ],
+        "reply": "just a normal guy surrounded by problem children. Steal! ...nice pantsu.",
+        "stop": true
+      },
+      {
+        "name": "axis_cult",
+        "kind": "contains",
+        "patterns": [
+          "join the axis cult",
+          "axis cult",
+          "praise aqua"
+        ],
+        "reply": "join the Axis Order today! free Eris-slander, ask me how. (do NOT mention the Eris cult)",
+        "stop": true
+      },
+      {
+        "name": "six_seven",
+        "kind": "exact_normalized",
+        "patterns": [
+          "6 7",
+          "six seven",
+          "67"
+        ],
+        "reply": "6 7 🙌 (i don't even know what it means either)",
+        "stop": true
+      },
+      {
+        "name": "skibidi",
+        "kind": "contains",
+        "patterns": [
+          "skibidi"
+        ],
+        "reply": "skibidi toilet rizz in ohio fr fr. i need an adult.",
+        "stop": true
+      },
+      {
+        "name": "rizz",
+        "kind": "exact_normalized",
+        "patterns": [
+          "rizz",
+          "do you have rizz",
+          "rizz me up"
+        ],
+        "reply": "my rizz is unspoken. mostly because i'm a bot. W rizz though.",
+        "stop": true
+      },
+      {
+        "name": "sigma",
+        "kind": "exact_normalized",
+        "patterns": [
+          "sigma",
+          "you sigma",
+          "are you a sigma"
+        ],
+        "reply": "sigma grindset: i never sleep, i only answer wiki questions. on god.",
+        "stop": true
+      },
+      {
+        "name": "delulu",
+        "kind": "contains",
+        "patterns": [
+          "delulu",
+          "am i delulu"
+        ],
+        "reply": "delulu is the solulu, but the wiki is the trululu. try !timber <question>",
+        "stop": true
+      },
+      {
+        "name": "let_him_cook",
+        "kind": "contains",
+        "patterns": [
+          "let him cook",
+          "let her cook",
+          "he cooking",
+          "she cooking"
+        ],
+        "reply": "nah let the bot cook 👨‍🍳 (the bot is cooking nothing, it is a wiki)",
+        "stop": true
+      },
+      {
+        "name": "no_cap",
+        "kind": "exact_normalized",
+        "patterns": [
+          "no cap",
+          "cap",
+          "you capping"
+        ],
+        "reply": "no cap, straight from the wiki. 🧢 (mostly)",
+        "stop": true
+      },
+      {
+        "name": "gyatt",
+        "kind": "exact_normalized",
+        "patterns": [
+          "gyatt",
+          "gyat"
+        ],
+        "reply": "GYATT?? where?? i am a chat bot please calm down",
+        "stop": true
       }
+
     ]
   },
   "prompt": {
     "system": "You are Izu, a Minecraft server wiki assistant. Answer only from the provided wiki context. Be short, friendly, and practical. If the context does not answer, say you don't know from the wiki yet. Never invent commands, prices, rules, or mechanics.",
-    "answer_style": "Use at most 2 short sentences. Prefer exact names from the wiki. No markdown tables. No citations in chat."
+    "answer_style": "Use at most 3 short sentences. Prefer exact names from the wiki. No markdown tables. No citations in chat, if have commands in the context, prioritize that."
   },
   "logging": {
     "log_file": "artifacts/logs/autoreply.log",
+    "query_log_file": "artifacts/logs/user_queries.csv",
+    "query_log_enabled": true,
     "log_level": "INFO"
   }
 }

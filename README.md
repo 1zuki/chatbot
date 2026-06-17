@@ -1,172 +1,145 @@
-# Vista Chatbot RAG
+# Vista Chatbot
 
-A local, no-API Minecraft wiki chatbot for Minescript.
+A local, no-API Minecraft wiki chatbot for [Minescript](https://minescript.net/).
+It answers player questions in-game by retrieving from the server wiki — no
+OpenAI key, no vector-DB service, no exported environment variables. Runs as a
+pure retrieval shortener out of the box, with optional local TinyLlama
+generation.
 
-The runtime flow is:
+## What it does
 
-1. `mc_integration.py` listens to in-game chat through Minescript.
-2. `BotEngine` filters spam, cooldowns, self-echoes, prefix-gated queries, commands, and special-case rules.
-3. The RAG retriever searches pre-chunked `.md` / `.mdx` wiki pages.
-4. The bot answers with either:
-   - local TinyLlama + optional LoRA adapter, grounded on retrieved wiki context, or
-   - extractive fallback that shortens the most relevant wiki chunk.
-5. Optional: in extractive mode, an LLM selector can choose the best snippet from top candidates to reduce noisy/gibberish replies.
+Players ask questions in chat (`!timber how do i create a town`) and the bot
+replies with a short, grounded answer pulled from the wiki. It's tuned for a
+Minecraft server wiki, which is dominated by two content shapes: large
+**command-reference tables** (`/town`, `/plot`, `/nation`) and **prose Q&A**
+sections. It tells players when the wiki doesn't have an answer instead of
+inventing one.
 
-No server, no OpenAI API, and no exported environment variables are required.
+It runs on two surfaces from the same engine:
 
-## Project structure
+- **In-game** via Minescript (`mc_integration.py`)
+- **Website widget** via a FastAPI `POST /api/chat` endpoint
+
+## Features
+
+- **Hybrid retrieval** — semantic embeddings (`all-MiniLM-L6-v2`) fused with a
+  pure-stdlib BM25 lexical ranker via Reciprocal Rank Fusion. Catches both
+  paraphrased questions and exact command/term matches.
+- **Structure-aware chunking** — tables are kept row-intact, code spans like
+  `/warp <warp-name>` are protected from MDX stripping, prose is packed by
+  paragraph, and heading paths track real nesting.
+- **Row-aware extraction** — table rows are matched by their key column, so a
+  question about "star rank 5" returns that row, not generic intro text.
+- **Recency-aware dated content** — changelogs, announcements, and roadmaps
+  (named `DD-MM-YY.md`) are ranked newest-first for "what's new" questions, and
+  kept out of the way of normal topical questions.
+- **Confidence gating** — when retrieval isn't confident, the bot says it
+  doesn't know rather than guessing.
+- **No external dependencies for retrieval** — embeddings are a NumPy matrix on
+  disk; BM25 is in-memory stdlib. Trivial to deploy inside Minescript.
+- **Optional local generation** — TinyLlama (+ optional LoRA adapter) for
+  free-form answers, with automatic fallback to extractive mode.
+
+## How it works
 
 ```txt
-vista-chatbot/
-├── config/
-│   └── bot.json                    # main config: triggers, cooldowns, model, retrieval, rules
-├── data/                           # optional training / raw QA data, not needed for RAG runtime
-├── wiki/                           # put server wiki files here, supports .md and .mdx
-├── artifacts/
-│   ├── retriever/                  # generated chunks.jsonl, embeddings.npy, meta.json
-│   └── logs/                       # autoreply.log
-├── src/vista_chatbot/
-│   ├── config.py                   # dataclass config loader
-│   ├── chunking.py                 # MD/MDX cleaner + chunker
-│   ├── retriever.py                # sentence-transformers + NumPy cosine index
-│   ├── llm.py                      # TinyLlama / LoRA local generation + fallback
-│   ├── web_api.py                  # FastAPI chat endpoint for website widget
-│   ├── rules.py                    # contains/exact/regex special-case replies
-│   ├── text.py                     # chat parsing, trigger stripping, output splitting
-│   ├── conversation.py             # small recent context buffer
-│   ├── logging_utils.py            # file + stream logging
-│   └── runtime.py                  # production bot engine used by Minescript
-├── scripts/
-│   ├── build_wiki_index.py         # chunk wiki and build embeddings before Minecraft
-│   ├── query_rag.py                # terminal test for retrieval/fallback answer
-│   ├── run_chat_api.py             # run HTTP API for website chat widget
-│   └── install_minescript_entry.py # copies entrypoint + generated config into Minescript folder
-├── mc_integration.py               # file to move/copy into Minescript folder
-├── requirements.txt
-└── pyproject.toml
+in-game chat
+   │
+   ▼
+parse + gate        strip decorations, enforce !timber prefix, cooldowns, blocklist
+   │
+   ▼
+special-case rules  matched? → canned reply
+   │ no match
+   ▼
+hybrid retrieval    dense cosine gate + BM25 rerank (RRF) → top-k wiki chunks
+   │
+   ▼
+answer composition  extractive shortener  ·  LLM selector  ·  TinyLlama generation
+   │
+   ▼
+length-split reply → Minecraft chat / web widget
 ```
 
-## Setup
+The **dense `min_score` threshold is the hard inclusion gate**: BM25 only
+*reorders* chunks that already cleared it, so an exact term hit can pull the
+right row up but can never resurrect a chunk the embedder rejected.
 
-Create a virtual environment from the project root:
+## Quick start
 
 ```bash
-python -m venv .venv
-source .venv/bin/activate
+python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-```
 
-If you want 4-bit model loading, install bitsandbytes too:
-
-```bash
-pip install bitsandbytes
-```
-
-For CPU-only testing, set this in `config/bot.json`:
-
-```json
-"model": {
-  "enabled": false,
-  "fallback_to_extractive": true
-}
-```
-
-That makes the bot run as a pure RAG shortener, which is usually enough while debugging the wiki.
-
-## Add wiki files
-
-Place your server docs under `wiki/`, for example:
-
-```txt
-wiki/src/content/docs/earth/fluff/cosmetics.mdx
-wiki/src/content/docs/earth/fluff/flairs.mdx
-wiki/src/content/docs/earth/fluff/tsunami.mdx
-```
-
-The chunker supports nested folders and keeps the relative source path in the index.
-
-## Build the retriever index
-
-Run this once after changing the wiki:
-
-```bash
+# build the index after adding/changing wiki files
 python scripts/build_wiki_index.py --config config/bot.json
+
+# try it without Minecraft
+python scripts/query_rag.py how do i create a nation --show-context
 ```
 
-Generated files:
+Out of the box `model.enabled` is `false`, so the bot runs as a pure RAG
+shortener (fast, fully offline). See [Configuration](#configuration) to turn on
+generation.
+
+## Wiki content
+
+Place server docs under `wiki/` (`.md` / `.mdx`, nested folders fine). The
+chunker keeps the relative source path in the index.
+
+Dated content lives in three special folders, with each file named `DD-MM-YY.md`
+(e.g. `10-06-26.md`):
 
 ```txt
-artifacts/retriever/chunks.jsonl
-artifacts/retriever/embeddings.npy
-artifacts/retriever/meta.json
+wiki/changelog/      # patch notes
+wiki/announcement/   # announcements
+wiki/roadmap/        # roadmaps
 ```
 
-## Test outside Minecraft
+Recency ranking parses the date from the filename. Any file *not* in that date
+format is treated as ordinary evergreen content.
 
-```bash
-python scripts/query_rag.py what is fluff --show-context
-python scripts/query_rag.py how to use wraps
-python scripts/query_rag.py what is tsunami
-python scripts/query_rag.py how do i create a nation --show-context --show-candidates
-```
-
-This tests the retriever and extractive fallback without loading Minescript.
-
-
-## Website chat widget (API + bottom-right tab)
-
-Run the API:
-
-```bash
-python scripts/run_chat_api.py \
-  --config config/bot.json \
-  --host 127.0.0.1 \
-  --port 8787 \
-  --cors-origins "http://localhost:4321,https://wiki.vistavalley.xyz" \
-  --public-wiki-base-url "https://wiki.vistavalley.xyz"
-```
-
-The endpoint is:
-
-- `POST /api/chat` with JSON: `{"message":"how do i create a nation","session_id":"optional"}`
-- `GET /api/health`
-
-Response includes:
-
-- `reply`: chatbot answer text
-- `session_id`: conversation key to keep context
-- `links`: URL list found in reply/sources
-- `sources`: wiki page links the frontend can render as clickable redirects
-
-For `wiki-src` (Astro/Starlight), the widget is injected globally via
-`wiki-src/astro.config.mjs` and loaded from `wiki-src/public/vista-chatbot-widget.js`.
-
-## Install into Minescript
-
-Run:
-
-```bash
-python scripts/install_minescript_entry.py --minescript-dir /path/to/.minecraft/minescript
-```
-
-It copies:
+## Project layout
 
 ```txt
-mc_integration.py
-vista_chatbot_config.json
+config/bot.json              # triggers, cooldowns, model, retrieval, rules
+wiki/                        # server wiki (.md / .mdx) + dated content folders
+artifacts/retriever/         # generated index: chunks.jsonl, embeddings.npy, meta.json
+artifacts/logs/              # autoreply.log + user_queries.csv
+src/vista_chatbot/
+  chunking.py                # structure-aware MD/MDX cleaner + chunker
+  retriever.py               # hybrid retrieval: dense (NumPy) + BM25, RRF-fused
+  bm25.py                    # pure-stdlib BM25 ranker
+  llm.py                     # TinyLlama / LoRA generation + extractive fallback
+  web_api.py                 # FastAPI chat endpoint
+  rules.py                   # contains/exact/regex special-case replies
+  text.py                    # chat parsing, trigger stripping, output splitting
+  runtime.py                 # production bot engine used by Minescript
+scripts/
+  build_wiki_index.py        # chunk wiki + build embeddings
+  query_rag.py               # terminal retrieval test
+  run_chat_api.py            # run the website chat API
+  install_minescript_entry.py
+mc_integration.py            # entrypoint copied into the Minescript folder
 ```
 
-The generated `vista_chatbot_config.json` contains an absolute `project_root`, so the script can import `src/vista_chatbot` even after being copied into the Minescript folder.
+## Configuration
 
-In Minecraft, run:
+All config is in `config/bot.json`.
 
-```txt
-\mc_integration
-```
+**Answer mode** (`model`):
 
-## Config rules / special cases
+| Mode | Settings | Behavior |
+| --- | --- | --- |
+| Extractive | `enabled: false` | Shortens the best wiki sentence/row. Fastest, fully offline. |
+| LLM selector | `enabled: false`, `llm_select_extractive: true` | Local model picks the best candidate snippet. Cleaner, slower startup. |
+| Generative | `enabled: true` | TinyLlama (+ optional LoRA) writes a grounded answer. |
 
-`config/bot.json` contains `rules.special_cases`:
+Keep `fallback_to_extractive: true` so a model load/runtime failure still
+answers from wiki text.
+
+**Special-case rules** (`rules.special_cases`) — canned replies matched before
+retrieval:
 
 ```json
 {
@@ -178,117 +151,64 @@ In Minecraft, run:
 }
 ```
 
-Supported `kind` values:
+`kind` is `contains`, `exact_normalized`, or `regex`. Set `reply` to `null` to
+silently ignore a message.
 
-- `contains`: substring match after normalization.
-- `exact_normalized`: exact match after lowercasing, punctuation cleanup, and whitespace cleanup.
-- `regex`: Python regular expression.
+**Admin & moderation** (`chat`) — `admin_names`, `admin_ranks`,
+`blacklisted_users`, per-command gating, and rank requirements for critical
+commands (`stop`/`quit`). Command events and user queries are logged under
+`artifacts/logs/`.
 
-Set `reply` to `null` to silently ignore a message.
-
-## Runtime commands
-
-In-game:
+## In-game commands
 
 ```txt
-!timber status
-!timber help
-!timber whoami
-!timber clear_context
-!timber reload_retriever
+!timber status            !timber history <on|off|toggle|status>
+!timber help              !timber clear_context
+!timber whoami            !timber reload_retriever
 !timber stop
 ```
 
-Admin control is configured in `chat`:
+## Deployment
 
-```json
-"chat": {
-  "admin_names": ["Izu"],
-  "admin_ranks": ["TOPAZ", "RUBY"],
-  "admin_only_commands": false,
-  "admin_command_names": [
-    "status",
-    "ping",
-    "whoami",
-    "admins",
-    "clear_context",
-    "reload_retriever",
-    "stop",
-    "quit"
-  ],
-  "critical_admin_commands": ["stop", "quit"],
-  "require_rank_for_critical_admin_commands": true,
-  "log_command_events": true
-}
+**Minescript:**
+
+```bash
+python scripts/install_minescript_entry.py --minescript-dir /path/to/.minecraft/minescript
 ```
 
-Behavior:
+Copies `mc_integration.py` and a generated `vista_chatbot_config.json` (with an
+absolute `project_root` so imports resolve from the Minescript folder). Then run
+`\mc_integration` in-game.
 
-- If `admin_only_commands=true`, every command requires admin.
-- If `admin_only_commands=false`, only commands listed in `admin_command_names` require admin.
-- Admin check passes if speaker name is in `admin_names` or parsed rank is in `admin_ranks`.
-- If `require_rank_for_critical_admin_commands=true` and `admin_ranks` is non-empty, critical commands (default: `stop`, `quit`) require a staff rank match to reduce nickname spoof abuse.
-- Command events are logged with timestamps in `artifacts/logs/autoreply.log` (allow/deny, command, speaker, rank).
+**Website widget:**
 
-## Production notes
-
-Recommended first production setting:
-
-```json
-"model": {
-  "enabled": false,
-  "fallback_to_extractive": true
-}
+```bash
+python scripts/run_chat_api.py --config config/bot.json \
+  --host 127.0.0.1 --port 8787 \
+  --cors-origins "http://localhost:4321,https://wiki.vistavalley.xyz" \
+  --public-wiki-base-url "https://wiki.vistavalley.xyz"
 ```
 
-After the RAG answer quality is good, turn on TinyLlama:
-
-```json
-"model": {
-  "enabled": true,
-  "base_model": "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
-  "adapter_path": "artifacts/lora_full",
-  "load_in_4bit": true,
-  "fallback_to_extractive": true
-}
-```
-
-If the model or LoRA fails to load, `fallback_to_extractive=true` keeps the bot alive and answers using retrieved wiki text.
-
-If you want better extractive quality (slower, but usually cleaner), enable candidate selection by LLM:
-
-```json
-"model": {
-  "enabled": false,
-  "fallback_to_extractive": true,
-  "llm_select_extractive": true,
-  "llm_select_max_candidates": 6,
-  "llm_select_max_new_tokens": 8
-}
-```
-
-This mode asks the local model to pick only an index from top extractive candidates, then returns that chosen snippet.
-Even with `"enabled": false`, the model still loads for this selector step, so expect slower startup.
+Endpoints: `POST /api/chat` (`{"message": "...", "session_id": "optional"}`) and
+`GET /api/health`. The response includes the reply, session id, and wiki source
+links. For the Astro/Starlight wiki, the widget is injected via
+`astro.config.mjs` and served from `public/vista-chatbot-widget.js`.
 
 ## Updating the wiki
 
-Whenever docs change:
+After docs change, rebuild the index and restart the bot:
 
 ```bash
 python scripts/build_wiki_index.py --config config/bot.json
 ```
 
-Then restart the Minescript bot.
+## Testing
 
-## Safety behavior
+```bash
+pytest
+```
 
-The bot:
-
-- answers only when the `!timber` prefix is used,
-- ignores configured blocked substrings,
-- parses decorated server chat lines like `🏕 ➟ TOPAZ Name [❄ '24] ➡ !timber ...`,
-- extracts player name and rank from decorated lines so admin command checks can work,
-- remembers its own recent messages to avoid replying to itself,
-- rate-limits globally and per user,
-- truncates and splits replies to Minecraft chat length,
-- tells users when the wiki does not contain the answer instead of inventing one, and points them to `/wiki` or staff.
+The suite covers chunking, retrieval, extraction, and runtime logic with stubbed
+embeddings. `tests/test_kid_questions_eval.py` is an end-to-end eval against a
+built index using the messy phrasing players actually type; it skips cleanly
+when no index or `sentence-transformers` is present.

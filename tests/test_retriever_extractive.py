@@ -142,6 +142,61 @@ def test_extractive_answer_avoids_guess_for_generic_richest_question():
     assert "ask staff" in out
 
 
+def test_howto_promotes_command_when_it_is_the_dense_winner():
+    # "how do i claim a land": a marketing line has higher raw overlap (claim +
+    # land) than the actionable command (claim only), so the overlap-first sort
+    # places it first. But the embedder scored the command strictly more relevant
+    # (0.495 > 0.415), so it should be promoted to the answer.
+    results = [
+        SearchResult(
+            chunk=_chunk(
+                text="Use the Towny plugin to claim and secure your land and valuables.",
+                source="wiki/towny/index.mdx",
+            ),
+            score=0.415,
+        ),
+        SearchResult(
+            chunk=_chunk(
+                text=(
+                    "To claim additional chunks, stand in an adjacent unclaimed chunk "
+                    "and type /t claim."
+                ),
+                source="wiki/towny/creating-a-town.mdx",
+            ),
+            score=0.495,
+        ),
+    ]
+    out = extractive_answer("how do i claim a land", results, max_chars=240).lower()
+    assert "/t claim" in out
+    assert "towny plugin" not in out
+
+
+def test_howto_does_not_promote_command_the_embedder_ranked_lower():
+    # "how can i increase my star rank": the only command is a TOWN-rank command
+    # (/t rank add) that the embedder scored well below the on-topic Stars intro
+    # (0.287 < 0.388). Promoting it would give a confidently wrong (off-topic)
+    # answer, so the score gate must keep it suppressed.
+    results = [
+        SearchResult(
+            chunk=_chunk(
+                text="Each star rank unlocks new perks that enhance the gameplay experience.",
+                source="wiki/gameplay/stars.mdx",
+            ),
+            score=0.388,
+        ),
+        SearchResult(
+            chunk=_chunk(
+                text="Ranks can be given to residents with the command /t rank add [Username] [Rank].",
+                source="wiki/towny/town-ranks.mdx",
+            ),
+            score=0.287,
+        ),
+    ]
+    out = extractive_answer("how can i increase my star rank", results, max_chars=240).lower()
+    assert "/t rank add" not in out
+    assert "star rank unlocks" in out
+
+
 def test_extractive_answer_navigation_query_requires_actionable_line():
     results = [
         SearchResult(

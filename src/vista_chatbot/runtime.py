@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 import logging
 import re
 import time
@@ -43,6 +44,9 @@ class BotEngine:
     def __init__(self, config: BotConfig):
         self.config = config
         self.logger = configure_logging(config.log_file, config.logging.log_level)
+        self._query_log_path: Path | None = config.query_log_file if self.config.logging.query_log_enabled else None
+        if self._query_log_path is not None:
+            self._ensure_query_log_header()
         self.rules = RuleEngine(config.rules)
         self.prompt_builder = PromptBuilder(config)
         self.generator = LocalGenerator(config, logger=self.logger)
@@ -53,6 +57,12 @@ class BotEngine:
         self._user_last_reply: dict[str, float] = defaultdict(float)
         self._minute_limiter = MinuteRateLimiter(config.chat.max_replies_per_minute)
         self._sent_messages: deque[SeenMessage] = deque(maxlen=24)
+        self._history_enabled = bool(config.chat.history_enabled)
+        self._blacklisted_users = set()
+        for name in self.config.chat.blacklisted_users:
+            key = normalize_text(name)
+            if key:
+                self._blacklisted_users.add(key)
 
     @classmethod
     def from_config_path(cls, path: str | Path) -> "BotEngine":
@@ -78,6 +88,8 @@ class BotEngine:
         rank = parsed.rank
 
         if not content:
+            return None
+        if self._is_blacklisted_user(speaker):
             return None
         if self._is_recent_self_echo(content, now):
             return None
@@ -135,6 +147,14 @@ class BotEngine:
     ) -> tuple[str | None, list[SearchResult]]:
         query = query[: self.config.chat.max_input_chars].strip()
         if apply_cooldown and not self._cooldown_allows(speaker, now):
+            self._log_user_query(
+                speaker=speaker,
+                rank=rank,
+                query=query,
+                results=[],
+                reply=None,
+                dropped_reason="cooldown",
+            )
             return None, []
         if not query or is_hi_pattern(query, self.config.chat.hi_patterns):
             return (
@@ -142,7 +162,10 @@ class BotEngine:
                 [],
             )
 
-        self.memory.add_user(query)
+        history: list = []
+        if self._history_enabled:
+            self.memory.add_user(query)
+            history = self.memory.recent(self.config.model.max_context_messages)
         results = self._retrieve(query)
         if not results:
             reply = UNKNOWN_WIKI_REPLY
@@ -150,7 +173,7 @@ class BotEngine:
             prompt = self.prompt_builder.build(
                 query=query,
                 results=results,
-                history=self.memory.recent(self.config.model.max_context_messages),
+                history=history,
             )
             reply = self.generator.generate_or_fallback(
                 prompt=prompt,
@@ -158,8 +181,17 @@ class BotEngine:
                 results=results,
                 max_chat_chars=self.config.chat.max_chat_chars,
             )
-        self.memory.add_assistant(reply)
+        if self._history_enabled:
+            self.memory.add_assistant(reply)
         self.logger.info("Reply speaker=%s rank=%s query=%r reply=%r", speaker, rank, query, reply)
+        self._log_user_query(
+            speaker=speaker,
+            rank=rank,
+            query=query,
+            results=results,
+            reply=reply,
+            dropped_reason=None,
+        )
         return self._finalize_reply(reply), results
 
     def split_reply(self, reply: str) -> list[str]:
@@ -187,6 +219,12 @@ class BotEngine:
     def _blocked(self, text: str) -> bool:
         t = normalize_text(text)
         return any(normalize_text(s) in t for s in self.config.chat.blocked_substrings)
+
+    def _is_blacklisted_user(self, speaker: str) -> bool:
+        who = normalize_text(speaker or "")
+        if not who:
+            return False
+        return who in self._blacklisted_users
 
     def _is_recent_self_echo(self, text: str, now: float) -> bool:
         normalized = normalize_text(text)
@@ -272,8 +310,11 @@ class BotEngine:
             "reloadretriever": "reload_retriever",
             "clear": "clear_context",
             "clearcontext": "clear_context",
+            "ctx": "history",
+            "context": "history",
         }
         cmd = aliases.get(cmd, cmd)
+        arg = parts[1].strip() if len(parts) > 1 else ""
 
         if cmd not in {
             "stop",
@@ -284,6 +325,7 @@ class BotEngine:
             "whoami",
             "admins",
             "clear_context",
+            "history",
             "reload_retriever",
         }:
             return None
@@ -311,7 +353,7 @@ class BotEngine:
             admin = "yes" if self._is_admin(speaker=speaker, rank=rank, command=cmd) else "no"
             return self._finalize_reply(
                 f"Vista online. speaker={speaker} rank={rank or '-'} admin={admin} wiki_chunks={chunks} "
-                f"llm_chat={llm_chat} llm_selector={selector}"
+                f"llm_chat={llm_chat} llm_selector={selector} history={self._history_state_label()}"
             )
         if cmd == "whoami":
             admin = "yes" if self._is_admin(speaker=speaker, rank=rank, command=cmd) else "no"
@@ -323,6 +365,8 @@ class BotEngine:
         if cmd == "clear_context":
             self.memory.clear()
             return self._finalize_reply("Conversation context cleared.")
+        if cmd == "history":
+            return self._finalize_reply(self._handle_history_command(arg))
         if cmd == "reload_retriever":
             return self._finalize_reply(self._reload_retriever_message())
         if cmd == "help":
@@ -388,8 +432,74 @@ class BotEngine:
         p = self.config.rules.command_prefix
         return (
             f"Use: {p} <question>. Commands: {p} help, {p} status, {p} whoami, "
-            f"{p} admins, {p} clear_context, {p} reload_retriever, {p} stop"
+            f"{p} admins, {p} history <on|off|toggle|status>, {p} clear_context, "
+            f"{p} reload_retriever, {p} stop"
         )
+
+    def _history_state_label(self) -> str:
+        return "on" if self._history_enabled else "off"
+
+    def _log_user_query(
+        self,
+        *,
+        speaker: str,
+        rank: str | None,
+        query: str,
+        results: list[SearchResult],
+        reply: str | None,
+        dropped_reason: str | None,
+    ) -> None:
+        if self._query_log_path is None:
+            return
+        reply_text = sanitize_chat_output(reply or "")
+        if dropped_reason:
+            reply_text = f"[dropped:{dropped_reason}]"
+        elif not reply_text:
+            reply_text = UNKNOWN_WIKI_REPLY
+        else:
+            reply_text = safe_truncate(reply_text, self.config.chat.max_chat_chars * 2)
+
+        try:
+            self._query_log_path.parent.mkdir(parents=True, exist_ok=True)
+            with self._query_log_path.open("a", encoding="utf-8", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerow([rank or "", speaker, query, reply_text])
+        except Exception as exc:
+            self.logger.warning("Failed to write user query log row: %s", exc)
+
+    def _ensure_query_log_header(self) -> None:
+        if self._query_log_path is None:
+            return
+        try:
+            self._query_log_path.parent.mkdir(parents=True, exist_ok=True)
+            needs_header = not self._query_log_path.exists() or self._query_log_path.stat().st_size == 0
+            if not needs_header:
+                return
+            with self._query_log_path.open("w", encoding="utf-8", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerow(["rank", "user", "queries", "reply"])
+        except Exception as exc:
+            self.logger.warning("Failed to initialize user query log file: %s", exc)
+
+    def _handle_history_command(self, arg: str) -> str:
+        p = self.config.rules.command_prefix
+        action = normalize_text(arg)
+        if action in {"", "status"}:
+            return f"Conversation history is {self._history_state_label()}."
+        if action in {"on", "enable", "enabled", "true", "1"}:
+            self._history_enabled = True
+            return "Conversation history enabled."
+        if action in {"off", "disable", "disabled", "false", "0"}:
+            self._history_enabled = False
+            self.memory.clear()
+            return "Conversation history disabled and context cleared."
+        if action == "toggle":
+            self._history_enabled = not self._history_enabled
+            if not self._history_enabled:
+                self.memory.clear()
+                return "Conversation history disabled and context cleared."
+            return "Conversation history enabled."
+        return f"Usage: {p} history <on|off|toggle|status>"
 
     def _finalize_reply(self, reply: str | None) -> str | None:
         if reply is None:
@@ -397,4 +507,4 @@ class BotEngine:
         reply = sanitize_chat_output(reply)
         if self.config.chat.reply_prefix:
             reply = f"{self.config.chat.reply_prefix}{reply}"
-        return safe_truncate(reply, self.config.chat.max_chat_chars * 3)
+        return reply

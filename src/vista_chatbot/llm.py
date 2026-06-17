@@ -9,11 +9,12 @@ from .config import BotConfig
 from .retriever import (
     UNKNOWN_WIKI_REPLY,
     SearchResult,
+    _answer_prefix,
     build_context,
     extractive_answer,
     extractive_candidates,
 )
-from .text import normalize_text, safe_truncate, sanitize_chat_output
+from .text import normalize_text, sanitize_chat_output
 
 
 @dataclass(frozen=True)
@@ -37,6 +38,11 @@ class PromptBuilder:
             f"Recent chat context, may be empty:\n{recent or '(none)'}\n\n"
             f"Wiki context:\n{context or '(no relevant wiki context)'}\n\n"
             f"Question: {query}\n"
+            "Answer rules:\n"
+            "- Keep it concise (max 3 short sentences).\n"
+            "- Do not say 'based on the context' or similar preamble.\n"
+            "- If unsure from wiki context, answer exactly: "
+            f"\"{UNKNOWN_WIKI_REPLY}\"\n\n"
             f"Answer for Minecraft chat:"
             f"\n</s>\n<|assistant|>\n"
         )
@@ -75,6 +81,11 @@ class LocalGenerator:
         results: list[SearchResult],
         max_chat_chars: int,
     ) -> str:
+        confidence_probe = extractive_answer(query, results, max_chars=max_chat_chars)
+        if confidence_probe == UNKNOWN_WIKI_REPLY:
+            # If retrieval confidence is too low, skip free-form generation.
+            return UNKNOWN_WIKI_REPLY
+
         if self._selector_enabled() and self.loaded and not self.config.model.enabled:
             return self._select_extractive_or_fallback(
                 query=query,
@@ -119,7 +130,7 @@ class LocalGenerator:
         new_tokens = out[0][inputs["input_ids"].shape[-1] :]
         text = self.tokenizer.decode(new_tokens, skip_special_tokens=True)
         text = self._clean_generation(text)
-        return safe_truncate(text, max_chat_chars)
+        return text
 
     def _load(self) -> None:  # pragma: no cover - depends on local ML stack
         import torch
@@ -162,12 +173,43 @@ class LocalGenerator:
             if marker in text:
                 text = text.split(marker)[0]
         text = sanitize_chat_output(text)
+        text = re.sub(
+            r"^(?:based on|according to)\s+(?:the\s+)?(?:provided\s+)?context[:,\s-]*",
+            "",
+            text,
+            flags=re.IGNORECASE,
+        )
+        text = re.sub(
+            r"\b(?:based on|according to)\s+(?:the\s+)?(?:provided\s+)?context\b[:,]?\s*",
+            "",
+            text,
+            flags=re.IGNORECASE,
+        )
+        text = re.sub(
+            r"\b(if you have any (?:other )?questions?.*|let me know if you need anything else.*)$",
+            "",
+            text,
+            flags=re.IGNORECASE,
+        )
+        text = sanitize_chat_output(text)
+        text = LocalGenerator._limit_sentences(text, max_sentences=2)
         if not text:
             return UNKNOWN_WIKI_REPLY
         normalized = normalize_text(text)
         if "dont know" in normalized or "don't know" in normalized:
             return UNKNOWN_WIKI_REPLY
+        if "i don't know from the wiki yet" in normalized:
+            return UNKNOWN_WIKI_REPLY
         return text
+
+    @staticmethod
+    def _limit_sentences(text: str, *, max_sentences: int) -> str:
+        if max_sentences <= 0:
+            return text
+        parts = [p.strip() for p in re.split(r"(?<=[.!?])\s+", text) if p.strip()]
+        if len(parts) <= max_sentences:
+            return text
+        return " ".join(parts[:max_sentences]).strip()
 
     def _needs_model(self) -> bool:
         return self.config.model.enabled or self._selector_enabled()
@@ -198,7 +240,7 @@ class LocalGenerator:
 
         selected = candidates[choice - 1]
         selected = sanitize_chat_output(selected)
-        return safe_truncate(f"Wiki says: {selected}", max_chat_chars)
+        return f"{_answer_prefix(query)}{selected}"
 
     def _choose_candidate_index(self, *, query: str, candidates: list[str]) -> int | None:
         if not self.loaded:

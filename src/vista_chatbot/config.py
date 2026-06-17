@@ -21,6 +21,8 @@ class ChatConfig:
     send_delay_seconds: float = 0.0
     ignore_after_send_seconds: float = 0.8
     max_input_chars: int = 800
+    history_enabled: bool = True
+    blacklisted_users: list[str] = field(default_factory=list)
     admin_names: list[str] = field(default_factory=list)
     admin_ranks: list[str] = field(default_factory=list)
     admin_only_commands: bool = False
@@ -31,6 +33,8 @@ class ChatConfig:
             "whoami",
             "admins",
             "clear_context",
+            "history",
+            "context",
             "reload_retriever",
             "stop",
             "quit",
@@ -73,8 +77,8 @@ class RetrievalConfig:
     top_k: int = 5
     min_score: float = 0.18
     max_context_chars: int = 1800
-    chunk_chars: int = 700
-    chunk_overlap: int = 120
+    chunk_chars: int = 500
+    chunk_overlap: int = 100
     wiki_globs: list[str] = field(default_factory=lambda: ["**/*.md", "**/*.mdx"])
 
 
@@ -103,6 +107,8 @@ class PromptConfig:
 @dataclass(frozen=True)
 class LoggingConfig:
     log_file: str = "artifacts/logs/autoreply.log"
+    query_log_file: str = "artifacts/logs/user_queries.csv"
+    query_log_enabled: bool = True
     log_level: str = "INFO"
 
 
@@ -132,6 +138,10 @@ class BotConfig:
     @property
     def log_file(self) -> Path:
         return resolve_path(self.logging.log_file, base=self.project_root)
+
+    @property
+    def query_log_file(self) -> Path:
+        return resolve_path(self.logging.query_log_file, base=self.project_root)
 
     @property
     def adapter_path(self) -> Path:
